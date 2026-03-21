@@ -1,0 +1,67 @@
+pip install openai google-generativeai sounddevice soundfile lameenc
+from google import genai
+from openai import OpenAI
+import sounddevice as sd
+import soundfile as sf
+import lameenc
+import io
+import os
+
+open_ai_client = OpenAI(api_key="YOUR_OPENAI_KEY")
+google_client = genai.Client(api_key="YOUR_GOOGLE_KEY")
+
+def record_to_mp3(filename="recording.mp3", duration=5, samplerate=44100, channels=1):
+    print(f"Recording for {duration} seconds...")
+    audio_data = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=channels, dtype='int16')
+    sd.wait()
+    print("Recording finished.")
+
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(128)
+    encoder.set_in_sample_rate(samplerate)
+    encoder.set_channels(channels)
+    encoder.set_quality(2)
+
+    mp3_data = encoder.encode(audio_data.tobytes())
+    mp3_data += encoder.flush()
+
+    with open(filename, "wb") as f:
+        f.write(mp3_data)
+
+    print(f"Saved as {os.path.abspath(filename)}")
+
+def generate_transcription(file_path):
+    with open(file_path, "rb") as audio_file:
+        transcription = open_ai_client.audio.transcriptions.create(
+            model="gpt-4o-transcribe",
+            file=audio_file
+        )
+    return transcription.text
+
+def get_gemini_answer(transcription):
+    prompt = f'The user said: "{transcription}". Detect the language and respond in the SAME language.'
+    response = google_client.models.generate_content(
+        model="gemini-3-flash-preview",
+        contents=prompt
+    )
+    return response.text
+
+def speak(text):
+    speech = open_ai_client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=text
+    )
+    with open("response.mp3", "wb") as f:
+        f.write(speech.read())
+
+def main():
+    record_to_mp3("recording.mp3", duration=5)
+    transcription = generate_transcription("recording.mp3")
+    print("You said:", transcription)
+    answer = get_gemini_answer(transcription)
+    print("Answer:", answer)
+    speak(answer)
+
+if __name__ == "__main__":
+    main()
