@@ -1,0 +1,124 @@
+import os
+import sounddevice as sd
+import lameenc
+from openai import OpenAI
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+# 🔑 LOAD ENV
+load_dotenv()
+
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
+# 🔌 SETUP CLIENTS
+openai_client = OpenAI(api_key=OPENAI_KEY)
+
+genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+# 🎤 RECORD AUDIO
+def record_audio(filename="input.mp3", duration=3, samplerate=44100):
+    print("\n🎤 Listening...")
+    
+    audio = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='int16')
+    sd.wait()
+
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(128)
+    encoder.set_in_sample_rate(samplerate)
+    encoder.set_channels(1)
+    encoder.set_quality(2)
+
+    mp3_data = encoder.encode(audio.tobytes())
+    mp3_data += encoder.flush()
+
+    with open(filename, "wb") as f:
+        f.write(mp3_data)
+
+    print("✅ Recording done")
+
+# 🧠 SPEECH → TEXT
+def speech_to_text(file="input.mp3"):
+    try:
+        with open(file, "rb") as f:
+            result = openai_client.audio.transcriptions.create(
+                model="gpt-4o-transcribe",
+                file=f
+            )
+        return result.text.lower()
+    except Exception as e:
+        print("❌ STT error:", e)
+        return ""
+
+# 🤖 AI RESPONSE
+def ask_ai(text):
+    try:
+        prompt = f"""
+You are a friendly cultural museum guide robot.
+
+User said: "{text}"
+
+Rules:
+- Respond in SAME language
+- Keep answer SHORT (1 sentence)
+- Be clear and educational
+"""
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        print("❌ AI error:", e)
+        return "Sorry, I couldn't answer that."
+
+# 🔊 TEXT → SPEECH
+def speak(text):
+    try:
+        print("🔊 Speaking:", text)
+
+        speech = openai_client.audio.speech.create(
+            model="gpt-4o-mini-tts",
+            voice="alloy",
+            input=text
+        )
+
+        with open("output.mp3", "wb") as f:
+            f.write(speech.read())
+
+        os.system("mpg123 output.mp3")
+
+    except Exception as e:
+        print("❌ TTS error:", e)
+
+# 🚀 MAIN LOOP
+def main():
+    print("🤖 Robot ready. Say 'hey guide'...")
+
+    while True:
+        record_audio()
+
+        text = speech_to_text()
+        if not text:
+            continue
+
+        print("👂 Heard:", text)
+
+        # 🎯 WAKE WORD
+        if "hey guide" not in text:
+            continue
+
+        speak("Hello, I am your guide.")
+
+        command = text.replace("hey guide", "").strip()
+
+        if not command:
+            speak("How can I help you?")
+            continue
+
+        answer = ask_ai(command)
+        print("🤖 Answer:", answer)
+
+        speak(answer)
+
+# ▶️ RUN
+if __name__ == "__main__":
+    main()
