@@ -1,126 +1,100 @@
 import os
-from dotenv import load_dotenv
-from openai import OpenAI
-from google import genai
+import time
 import pyttsx3
+from dotenv import load_dotenv
+from google import genai
 
-# ========================
-# ⚙️ SETTINGS
-# ========================
-USE_MIC = False   # 🔴 change to True when you have a microphone
-
-# ========================
-# 🔑 LOAD KEYS
-# ========================
+# =========================
+# 🔐 LOAD ENV
+# =========================
 load_dotenv()
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ========================
+if not GEMINI_API_KEY:
+    print("❌ Gemini API key not found. Check your .env file.")
+    exit()
+
+# =========================
+# 🤖 GEMINI SETUP
+# =========================
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# =========================
 # 🔊 TEXT TO SPEECH
-# ========================
-engine = pyttsx3.init()
+# =========================
+engine = pyttsx3.init(driverName='espeak')
+engine.setProperty('rate', 170)
 
 def speak(text):
-    print("🔊:", text)
+    print(f"🤖: {text}")
     engine.say(text)
     engine.runAndWait()
 
-# ========================
-# 🎤 (OPTIONAL) MIC SETUP
-# ========================
-if USE_MIC:
-    import sounddevice as sd
-    import soundfile as sf
+# =========================
+# 🎤 SETTINGS
+# =========================
+USE_MIC = False   # 🔥 CHANGE TO True when mic works
 
-    def record_audio(filename="input.wav", duration=3):
-        fs = 16000
-        print("\n🎤 Listening...")
-        audio = sd.rec(int(duration * fs), samplerate=fs, channels=1)
-        sd.wait()
-        sf.write(filename, audio, fs)
-        print("✅ Recorded")
+# =========================
+# 🎤 MIC FUNCTION (basic placeholder)
+# =========================
+def listen():
+    # You will replace this later with real mic code
+    return input("🎤 You: ")
 
-# ========================
-# 🧠 SPEECH TO TEXT
-# ========================
-def speech_to_text(filename="input.wav"):
+# =========================
+# 🧠 ASK GEMINI
+# =========================
+def ask_gemini(prompt):
     try:
-        with open(filename, "rb") as f:
-            result = openai_client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",
-                file=f
-            )
-        print("✅ Using Whisper")
-        return result.text.lower()
-
-    except Exception as e:
-        print("⚠️ Whisper failed:", e)
-        return ""
-
-# ========================
-# 🤖 AI RESPONSE
-# ========================
-def ask_ai(text):
-    try:
-        prompt = f"""
-You are a cultural museum guide robot.
-
-User said: "{text}"
-
-Rules:
-- Respond in SAME language
-- Keep it SHORT (1 sentence)
-- Be clear and educational
-"""
-        response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
             contents=prompt
         )
         return response.text
-
     except Exception as e:
-        print("❌ AI error:", e)
-        return "Sorry, I couldn't answer that."
+        return f"⚠️ Error: {e}"
 
-# ========================
-# 🚀 MAIN LOOP
-# ========================
+# =========================
+# 🤖 MAIN LOOP
+# =========================
 def main():
-    print("🤖 Robot ready. Say 'hey guide'...")
+    speak("Hello! I am your cultural guide. Say 'hey guide' to begin.")
 
     while True:
-
-        # 🟢 INPUT MODE
         if USE_MIC:
-            record_audio()
-            text = speech_to_text()
+            text = listen()
         else:
-            text = input("\nType something: ").lower()
+            text = input("⌨️ Type: ")
 
-        if not text:
-            continue
+        text = text.lower()
 
-        print("👂 Heard:", text)
+        # Exit
+        if "exit" in text or "quit" in text:
+            speak("Goodbye!")
+            break
 
-        # 🎯 WAKE WORD
-        if "hey guide" not in text:
-            continue
+        # Wake word
+        if "hey guide" in text:
+            speak("Yes, how can I help you?")
 
-        speak("Hello, I am your guide.")
+            if USE_MIC:
+                user_question = listen()
+            else:
+                user_question = input("⌨️ Question: ")
 
-        command = text.replace("hey guide", "").strip()
+            speak("Let me think...")
 
-        if not command:
-            speak("How can I help you?")
-            continue
+            answer = ask_gemini(user_question)
 
-        answer = ask_ai(command)
-        print("🤖 Answer:", answer)
+            speak(answer)
 
-        speak(answer)
+        else:
+            print("💤 Waiting for 'hey guide'...")
 
+# =========================
 # ▶️ RUN
+# =========================
 if __name__ == "__main__":
     main()
