@@ -1,3 +1,5 @@
+import cv2
+import numpy as np
 import sounddevice as sd
 from scipy.io.wavfile import write
 import openai
@@ -7,6 +9,7 @@ from langdetect import detect
 import webrtcvad
 import os
 import json
+import time
 
 # -----------------------------
 # CONFIG
@@ -18,16 +21,6 @@ SAMPLE_RATE = 16000
 FRAME_DURATION = 30
 VAD_MODE = 1
 MEMORY_FILE = "memory.json"
-
-# -----------------------------
-# EXHIBIT DATABASE (CUSTOMIZE THIS!)
-# -----------------------------
-EXHIBITS = {
-    "robot arm": "This robotic arm demonstrates industrial automation used in factories.",
-    "ai robot": "This robot uses artificial intelligence to interact with humans.",
-    "mars rover": "This rover is based on robots used to explore Mars.",
-    "drone": "Drones like this are used for delivery, filming, and research.",
-}
 
 # -----------------------------
 # LOAD / SAVE MEMORY
@@ -45,21 +38,19 @@ def save_memory(history):
 history_data = load_memory()
 
 # -----------------------------
-# GEMINI SETUP (WITH PERSONALITY)
+# GEMINI SETUP
 # -----------------------------
 model = genai.GenerativeModel("gemini-1.5-flash")
-
 chat = model.start_chat(history=history_data + [
     {
         "role": "user",
         "parts": ["""
 You are an enthusiastic museum tour guide in a robotics and science museum.
-
 RULES:
-- Only talk about museum exhibits
+- Only talk about museum exhibits and paintings
 - Be engaging and tell short stories
 - Ask follow-up questions sometimes
-- Adapt to the visitor's language
+- Adapt to visitor's language
 - Use simple explanations for kids if needed
 """]
     }
@@ -100,9 +91,6 @@ def record_until_silence():
     write(temp.name, SAMPLE_RATE, b"".join(frames))
     return temp.name
 
-# -----------------------------
-# SPEECH TO TEXT (Whisper)
-# -----------------------------
 def speech_to_text(audio_file):
     with open(audio_file, "rb") as f:
         result = openai.audio.transcriptions.create(
@@ -111,9 +99,6 @@ def speech_to_text(audio_file):
         )
     return result.text.strip()
 
-# -----------------------------
-# DETECT LANGUAGE
-# -----------------------------
 def detect_language(text):
     try:
         return detect(text)
@@ -121,23 +106,65 @@ def detect_language(text):
         return "en"
 
 # -----------------------------
-# MATCH EXHIBIT
+# PAINTING RECOGNITION
 # -----------------------------
-def find_exhibit(text):
-    for key, value in EXHIBITS.items():
-        if key in text.lower():
-            return value
+painting_database = {
+    "red_circle": "The Red Circle",
+    "blue_square": "Blue Square Painting",
+    "yellow_triangle": "Triangle of Light",
+    "green_rectangle": "Emerald Landscape"
+}
+
+def capture_image():
+    cap = cv2.VideoCapture(0)
+    ret, frame = cap.read()
+    cap.release()
+    if ret:
+        return frame
     return None
 
+def detect_dominant_color(image):
+    img = cv2.resize(image, (100, 100))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pixels = img.reshape((-1, 3))
+    avg_color = np.mean(pixels, axis=0)
+    r, g, b = avg_color
+    if r > g and r > b:
+        return "red"
+    elif g > r and g > b:
+        return "green"
+    elif b > r and b > g:
+        return "blue"
+    elif r > 200 and g > 200 and b < 100:
+        return "yellow"
+    return "unknown"
+
+def detect_shape(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5,5), 0)
+    _, thresh = cv2.threshold(blurred, 60, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        return "unknown"
+    c = max(contours, key=cv2.contourArea)
+    approx = cv2.approxPolyDP(c, 0.04 * cv2.arcLength(c, True), True)
+    vertices = len(approx)
+    if vertices == 3:
+        return "triangle"
+    elif vertices == 4:
+        return "square"
+    elif vertices > 4:
+        return "circle"
+    return "unknown"
+
+def map_to_painting(color, shape):
+    key = f"{color}_{shape}"
+    return painting_database.get(key, "Unknown Painting")
+
 # -----------------------------
-# GEMINI RESPONSE (WITH MEMORY)
+# GEMINI RESPONSE WITH MEMORY
 # -----------------------------
 def get_ai_response(user_text, lang):
-    exhibit_info = find_exhibit(user_text)
-
-    if exhibit_info:
-        user_text += f"\nContext about exhibit: {exhibit_info}"
-
     prompt = f"""
 Visitor language: {lang}
 Respond in the SAME language.
@@ -145,59 +172,69 @@ Respond in the SAME language.
 Visitor: {user_text}
 Guide:
 """
-
     response = chat.send_message(prompt)
-
-    # Save memory
     history_data.append({"role": "user", "parts": [user_text]})
     history_data.append({"role": "model", "parts": [response.text]})
     save_memory(history_data)
-
     return response.text
 
 # -----------------------------
-# OPENAI TTS (REALISTIC VOICE)
+# OPENAI TTS
 # -----------------------------
 def speak(text):
     temp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-
     with openai.audio.speech.with_streaming_response.create(
         model="gpt-4o-mini-tts",
         voice="alloy",
         input=text
     ) as response:
         response.stream_to_file(temp.name)
-
     os.system(f"aplay {temp.name}")
 
 # -----------------------------
 # MAIN LOOP
 # -----------------------------
 def main():
-    print("🤖 Advanced Museum AI Guide Ready!\n")
-
+    print("🤖 Museum AI Guide Ready!\n")
     while True:
         try:
+            # Step 1: Capture painting
+            image = capture_image()
+            if image is None:
+                print("Failed to capture image, retrying...")
+                time.sleep(1)
+                continue
+
+            color = detect_dominant_color(image)
+            shape = detect_shape(image)
+            painting_title = map_to_painting(color, shape)
+            print(f"Detected Painting: {painting_title}")
+
+            # Step 2: Explain painting
+            explanation = get_ai_response(f"Visitor is looking at {painting_title}. Explain briefly and ask if they want to know more.", "en")
+            print("🤖 Guide:", explanation)
+            speak(explanation)
+
+            # Step 3: Listen to visitor
             audio_file = record_until_silence()
+            visitor_text = speech_to_text(audio_file)
+            print("🧑 Visitor:", visitor_text)
 
-            user_text = speech_to_text(audio_file)
-            print("🧑 Visitor:", user_text)
-
-            if user_text.lower() in ["exit", "quit", "stop"]:
+            if visitor_text.lower() in ["exit", "quit", "stop"]:
                 speak("Goodbye! Enjoy the museum.")
                 break
 
-            lang = detect_language(user_text)
+            lang = detect_language(visitor_text)
 
-            ai_response = get_ai_response(user_text, lang)
-            print("🤖 Guide:", ai_response)
-
-            speak(ai_response)
+            # Step 4: Check for follow-up
+            if "yes" in visitor_text.lower() or "tell me more" in visitor_text.lower():
+                extra = get_ai_response(f"Visitor wants to know more about {painting_title}", lang)
+                print("🤖 Guide (extra):", extra)
+                speak(extra)
 
         except KeyboardInterrupt:
             print("\nStopping...")
             break
-
         except Exception as e:
             print("Error:", e)
             speak("Sorry, something went wrong.")
