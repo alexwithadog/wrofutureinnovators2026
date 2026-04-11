@@ -2,11 +2,10 @@ import os
 import time
 import threading
 import queue
-import subprocess
-import tempfile
 from dotenv import load_dotenv
 from google import genai
 from fusion_hat.stt import Vosk as STT  # type: ignore
+from fusion_hat.tts import Espeak  # type: ignore
 
 
 class MuseumHelmet:
@@ -19,10 +18,13 @@ class MuseumHelmet:
 
         # Speech-to-text / text-to-speech
         self.stt = STT(language="fr")
+        self.tts = Espeak()
 
-        # Piper settings
-        self.piper_model = "fr_FR-siwis-medium"
-        self.piper_data_dir = os.path.expanduser("~/piper_voices")
+        # Voice settings
+        self.tts.set_amp(200)
+        self.tts.set_speed(150)
+        self.tts.set_gap(1)
+        self.tts.set_pitch(70)
 
         # Wake word
         self.wake_word = "atlas"
@@ -74,33 +76,7 @@ Always sound like a helpful museum guide beside the visitor, not an audio encycl
 
     def say(self, text):
         print(f"🤖 {text}")
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-            wav_path = tmp_wav.name
-
-        try:
-            subprocess.run(
-                [
-                    "python3",
-                    "-m",
-                    "piper",
-                    "--model",
-                    self.piper_model,
-                    "--data-dir",
-                    self.piper_data_dir,
-                    "--output-file",
-                    wav_path,
-                ],
-                input=text,
-                text=True,
-                check=True,
-            )
-
-            subprocess.run(["aplay", wav_path], check=True)
-
-        finally:
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
+        self.tts.say(text)
 
     def _stt_worker(self, result_queue, stop_event):
         try:
