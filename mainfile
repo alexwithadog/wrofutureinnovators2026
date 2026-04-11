@@ -25,10 +25,11 @@ class MuseumHelmet:
         self.piper_data_dir = os.path.expanduser("~/piper_voices")
 
         # Wake word
-        self.wake_words = ["atlas", "hello helmet", "guide", "assistant"]
+        self.wake_words = ["atlas", "helmet", "guide", "assistant"]
 
         # Silence timeout in seconds
         self.silence_timeout = 3
+        self.followup_timeout = 3
 
         # AI system prompt
         self.system_prompt = """
@@ -189,6 +190,21 @@ Keep it short unless the visitor asks for more.
 
         return "Sorry, I could not answer that."
 
+    def conversation_mode(self, first_question):
+        question = first_question
+
+        while True:
+            if question:
+                answer = self.ask_ai(question)
+                self.say(answer)
+
+            next_question = self.listen_once(silence_timeout=self.followup_timeout)
+
+            if not next_question:
+                break
+
+            question = next_question
+
     def handle_command(self, text):
         print(f"\n[Heard]: {text}")
 
@@ -200,23 +216,22 @@ Keep it short unless the visitor asks for more.
             self.say("Okay.")
             return True
 
-        if self.wake_word in text:
-            cleaned = text.replace(self.wake_word, "").strip()
+        for wake_word in self.wake_words:
+            if wake_word in text:
+                cleaned = text.replace(wake_word, "").strip()
 
-            if cleaned == "":
-                self.say("Yes? What would you like to know?")
-                question = self.listen_once(silence_timeout=self.silence_timeout)
+                if cleaned == "":
+                    self.say("Yes? What would you like to know?")
+                    question = self.listen_once(silence_timeout=self.silence_timeout)
 
-                if question:
-                    answer = self.ask_ai(question)
-                    self.say(answer)
+                    if question:
+                        self.conversation_mode(question)
+                    else:
+                        self.say("I did not hear a question.")
                 else:
-                    self.say("I did not hear a question.")
-            else:
-                answer = self.ask_ai(cleaned)
-                self.say(answer)
+                    self.conversation_mode(cleaned)
 
-            return True
+                return True
 
         return True
 
