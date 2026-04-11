@@ -1,8 +1,9 @@
 import os
+import time
 from dotenv import load_dotenv
 from google import genai
-from fusion_hat.stt import Vosk as STT # type: ignore
-from fusion_hat.tts import Espeak # type: ignore
+from fusion_hat.stt import Vosk as STT  # type: ignore
+from fusion_hat.tts import Espeak  # type: ignore
 
 
 class MuseumHelmet:
@@ -25,6 +26,9 @@ class MuseumHelmet:
 
         # Wake word
         self.wake_word = "atlas"
+
+        # Silence timeout in seconds
+        self.silence_timeout = 3
 
         # AI system prompt
         self.system_prompt = """
@@ -54,6 +58,7 @@ Core behavior:
 - If the user asks about safety or security, answer briefly, respectfully, and calmly
 
 Conversation rules:
+- Never give more than 3 short sentences unless the visitor explicitly asks for more detail
 - Do not dominate the conversation
 - Do not dump too much information at once
 - Do not give a lecture unless asked
@@ -69,11 +74,6 @@ Privacy and safety:
 - If a request involves safety, emergencies, suspicious situations, or security concerns, respond clearly, calmly, and responsibly
 - Keep the safety role secondary unless the user brings it up
 
-Answer style examples:
-- Good: "That statue is from the late Roman period. It's important because it shows how power and religion were linked. Want the quick background?"
-- Good: "This pattern is traditional in many Islamic artworks because it reflects order and infinity. I can also explain the symbolism if you want."
-- Bad: long formal speeches, bullet-point lectures, robotic phrasing, repeated disclaimers, or overly academic explanations
-
 Always sound like a helpful museum guide beside the visitor, not an audio encyclopedia.
 """
 
@@ -81,33 +81,60 @@ Always sound like a helpful museum guide beside the visitor, not an audio encycl
         print(f"🤖 {text}")
         self.tts.say(text)
 
-    def listen_once(self):
+    def listen_once(self, silence_timeout=3):
         print("🎤 Listening...")
         final_text = ""
+        last_partial = ""
+        last_speech_time = time.time()
+        heard_anything = False
 
         for result in self.stt.listen(stream=True):
+            now = time.time()
+
             if result["done"]:
                 final_text = result["final"].strip().lower()
-                print(f"\r\x1b[Kfinal: {final_text}")
-                return final_text
-            else:
-                partial = result["partial"].strip().lower()
-                print(f"\r\x1b[Kpartial: {partial}", end="", flush=True)
+                if final_text:
+                    print(f"\r\x1b[Kfinal: {final_text}")
+                    return final_text
 
-        return final_text
+            partial = result.get("partial", "").strip().lower()
+
+            if partial:
+                heard_anything = True
+
+                if partial != last_partial:
+                    last_partial = partial
+                    last_speech_time = now
+                    print(f"\r\x1b[Kpartial: {partial}", end="", flush=True)
+
+            # If speech started and then there is silence for N seconds,
+            # stop listening and use the last partial text.
+            if heard_anything and (now - last_speech_time >= silence_timeout):
+                print(f"\r\x1b[Kfinal (timeout): {last_partial}")
+                return last_partial
+
+        return final_text or last_partial
 
     def ask_ai(self, user_text):
         prompt = f"""
 {self.system_prompt}
 
-User: {user_text}
-Assistant:
+Visitor says: {user_text}
+
+Reply as the museum guide helmet in a natural, human, conversational way.
+Keep it short unless the visitor asks for more.
 """
         response = self.client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt
         )
-        return response.text.strip() if response.text else "Sorry, I could not answer that."
+
+        print("Gemini raw response:", response)
+
+        if hasattr(response, "text") and response.text:
+            return response.text.strip()
+
+        return "Sorry, I could not answer that."
 
     def handle_command(self, text):
         if text in ["goodbye", "good bye", "exit", "quit", "stop program"]:
@@ -123,7 +150,7 @@ Assistant:
 
             if cleaned == "":
                 self.say("Yes? What would you like to know?")
-                question = self.listen_once()
+                question = self.listen_once(silence_timeout=self.silence_timeout)
 
                 if question:
                     answer = self.ask_ai(question)
@@ -144,7 +171,7 @@ Assistant:
         running = True
         while running:
             try:
-                text = self.listen_once()
+                text = self.listen_once(silence_timeout=self.silence_timeout)
 
                 if not text:
                     continue
