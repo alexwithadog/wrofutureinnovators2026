@@ -1,8 +1,8 @@
 import os
 from dotenv import load_dotenv
 from google import genai
-from fusion_hat.stt import Vosk as STT
-from fusion_hat.tts import Espeak
+from fusion_hat.stt import Vosk as STT # type: ignore
+from fusion_hat.tts import Espeak # type: ignore
 
 
 class MuseumHelmet:
@@ -64,7 +64,7 @@ User: {user_text}
 Assistant:
 """
         response = self.client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=prompt
         )
         return response.text.strip() if response.text else "Sorry, I could not answer that."
