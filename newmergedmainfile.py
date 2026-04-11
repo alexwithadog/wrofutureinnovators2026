@@ -11,21 +11,24 @@ from google import genai
 from fusion_hat.stt import Vosk as STT  # type: ignore
 
 
+# =========================
+# CAMERA / COLOR SETTINGS
+# =========================
 HISTORY_WINDOW = 12
 MIN_HISTORY_MATCHES = 4
 POSITION_STABILITY_TOLERANCE = 37
 SIZE_STABILITY_TOLERANCE = 12
 SIZE_CHANGE_DELTA_TOLERANCE = 14
 SIZE_CHANGE_FREQUENCY_THRESHOLD = 0.75
-KEEP_UNCONFIRMED_DETECTIONS = False  # no touchies
+KEEP_UNCONFIRMED_DETECTIONS = False
 MATCH_SCORE_TOLERANCE = 70
-NESTED_BOX_MARGIN = 3  # no touchies
-NESTED_REQUIRE_SAME_COLOR = True  # no touchies
-MIN_CONTOUR_AREA = 450  # no touchies
+NESTED_BOX_MARGIN = 3
+NESTED_REQUIRE_SAME_COLOR = True
+MIN_CONTOUR_AREA = 450
+
 CAMERA_SIZE = (640, 480)
 CAMERA_FORMAT = "BGR888"
 CAMERA_WARMUP_SECONDS = 0.2
-
 
 RED_LOWER_1 = (0, 120, 80)
 RED_UPPER_1 = (10, 255, 255)
@@ -38,16 +41,11 @@ GREEN_UPPER = (70, 255, 255)
 
 
 def create_picamera2_instance():
-    """Loads Picamera2 only at runtime so this file can still be edited off-device."""
     picamera2_module = importlib.import_module("picamera2")
     return picamera2_module.Picamera2()
 
 
 def detect_color(frame):
-    """
-    Detects color patches in the image.
-    Returns list of tuples: (color, position, size)
-    """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     color_ranges = {
@@ -73,9 +71,6 @@ def detect_color(frame):
 
 
 def filter_detections(past_detections):
-    """
-    Filters detections to keep only stable/static ones.
-    """
     if not past_detections:
         return []
 
@@ -113,12 +108,12 @@ def filter_detections(past_detections):
         hs = [item[3] for item in matched_history]
 
         is_position_static = (
-            (max(xs) - min(xs) <= POSITION_STABILITY_TOLERANCE) and
-            (max(ys) - min(ys) <= POSITION_STABILITY_TOLERANCE)
+            max(xs) - min(xs) <= POSITION_STABILITY_TOLERANCE
+            and max(ys) - min(ys) <= POSITION_STABILITY_TOLERANCE
         )
         is_size_static = (
-            (max(ws) - min(ws) <= SIZE_STABILITY_TOLERANCE) and
-            (max(hs) - min(hs) <= SIZE_STABILITY_TOLERANCE)
+            max(ws) - min(ws) <= SIZE_STABILITY_TOLERANCE
+            and max(hs) - min(hs) <= SIZE_STABILITY_TOLERANCE
         )
 
         size_change_count = 0
@@ -200,13 +195,14 @@ class MuseumHelmet:
         # Wake words
         self.wake_words = ["atlas", "helmet", "guide", "assistant"]
 
-        # Silence timeout in seconds
+        # Voice timing
         self.silence_timeout = 3
         self.followup_timeout = 3
 
-        # Camera-to-museum behavior
+        # Camera-triggered speaking
         self.color_hold_seconds = 1.5
         self.color_cooldown_seconds = 8.0
+
         self.last_seen_color = None
         self.color_first_seen_time = None
         self.last_color_trigger_time = {
@@ -215,17 +211,18 @@ class MuseumHelmet:
             "green": 0.0,
         }
 
+        self.last_terminal_colors = None
+
         self.color_object_prompts = {
-            "red": "The visitor seems to be looking at the Mona Lisa. Give a short, natural museum-guide style explanation about the Mona Lisa: what it is, why it matters, and one interesting detail.",
-            "blue": "The visitor seems to be looking at diamonds or a precious blue gem display. Give a short, natural museum-guide style explanation about diamonds or blue precious gems: what they are, why they matter, and one interesting detail.",
-            "green": "The visitor seems to be looking at an emerald or green artifact display. Give a short, natural museum-guide style explanation about emeralds or green historical artifacts: what they are, why they matter, and one interesting detail.",
+            "red": "The visitor seems to be looking at a red-themed artwork, such as the Mona Lisa or another famous painting. Give a short, natural museum-guide explanation about it: what it is, why it matters, and one interesting detail.",
+            "blue": "The visitor seems to be looking at a blue object, such as diamonds or a precious blue gem display. Give a short, natural museum-guide explanation about diamonds or blue precious gems: what they are, why they matter, and one interesting detail.",
+            "green": "The visitor seems to be looking at a green object, such as an emerald or green historical artifact. Give a short, natural museum-guide explanation about it: what it is, why it matters, and one interesting detail.",
         }
 
         self.speaking_lock = threading.Lock()
         self.is_speaking = threading.Event()
         self.stop_camera_event = threading.Event()
 
-        # AI system prompt
         self.system_prompt = """
 You are a museum cultural guide helmet with a secondary safety role.
 
@@ -390,7 +387,7 @@ Keep it short unless the visitor asks for more.
     def ask_ai_from_camera_color(self, color_name):
         color_prompt = self.color_object_prompts.get(
             color_name,
-            f"The visitor seems to be looking at something {color_name}. Give a short, natural museum-guide explanation about an object associated with that color."
+            f"The visitor seems to be looking at a {color_name} object. Give a short museum-guide explanation about an object associated with that color."
         )
 
         prompt = f"""
@@ -405,6 +402,7 @@ Task:
 Reply as the museum guide helmet in a natural, human, conversational way.
 Keep it short, around 1 to 3 short sentences.
 """
+
         response = self.client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt
@@ -422,6 +420,17 @@ Keep it short, around 1 to 3 short sentences.
         current_time = time.time()
 
         detected_colors = [det[0] for det in relevant_detections]
+
+        if detected_colors:
+            unique_colors = sorted(set(detected_colors))
+            if unique_colors != self.last_terminal_colors:
+                print(f"[Camera detected colors]: {', '.join(unique_colors)}")
+                self.last_terminal_colors = unique_colors
+        else:
+            if self.last_terminal_colors is not None:
+                print("[Camera detected colors]: none")
+                self.last_terminal_colors = None
+
         dominant_color = detected_colors[0] if detected_colors else None
 
         if dominant_color is None:
@@ -442,13 +451,13 @@ Keep it short, around 1 to 3 short sentences.
         off_cooldown = (current_time - self.last_color_trigger_time[dominant_color]) >= self.color_cooldown_seconds
 
         if held_long_enough and off_cooldown and not self.is_speaking.is_set():
+            print(f"[Camera trigger]: {dominant_color} held for {self.color_hold_seconds} seconds")
             self.last_color_trigger_time[dominant_color] = current_time
 
             answer = self.ask_ai_from_camera_color(dominant_color)
             if answer:
                 self.say(answer)
 
-            # reset so it must be held again before retriggering
             self.color_first_seen_time = current_time
 
     def camera_worker(self):
@@ -471,6 +480,12 @@ Keep it short, around 1 to 3 short sentences.
 
             detection_results = []
 
+            draw_colors = {
+                "red": (0, 0, 255),
+                "blue": (255, 0, 0),
+                "green": (0, 255, 0),
+            }
+
             while not self.stop_camera_event.is_set():
                 frame = picam2.capture_array()
 
@@ -483,24 +498,33 @@ Keep it short, around 1 to 3 short sentences.
 
                 self.maybe_trigger_color_explanation(relevant_detections)
 
-                # Optional preview window:
-                # uncomment these lines if you want to see the camera feed
-                # draw_colors = {
-                #     "red": (0, 0, 255),
-                #     "blue": (255, 0, 0),
-                #     "green": (0, 255, 0),
-                # }
-                # preview = frame.copy()
-                # for color_name, position, size in relevant_detections:
-                #     x, y = position
-                #     w, h = size
-                #     draw_color = draw_colors.get(color_name, (255, 255, 255))
-                #     cv2.rectangle(preview, (x - w // 2, y - h // 2), (x + w // 2, y + h // 2), draw_color, 2)
-                #     cv2.putText(preview, color_name, (x - w // 2, y - h // 2 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_color, 2)
-                # cv2.imshow("Color Detection", preview)
-                # if cv2.waitKey(1) & 0xFF == ord('q'):
-                #     self.stop_camera_event.set()
-                #     break
+                preview = frame.copy()
+                for color_name, position, size in relevant_detections:
+                    x, y = position
+                    w, h = size
+                    draw_color = draw_colors.get(color_name, (255, 255, 255))
+                    cv2.rectangle(
+                        preview,
+                        (x - w // 2, y - h // 2),
+                        (x + w // 2, y + h // 2),
+                        draw_color,
+                        2
+                    )
+                    cv2.putText(
+                        preview,
+                        color_name,
+                        (x - w // 2, y - h // 2 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        draw_color,
+                        2
+                    )
+
+                cv2.imshow("Color Detection", preview)
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    self.stop_camera_event.set()
+                    break
 
                 time.sleep(0.05)
 
