@@ -8,7 +8,7 @@ tts.set_amp(200)
 # Set speed 80-260, default 150
 tts.set_speed(150)
 # Set gap 0-200, default 1
-tts.set_gap(2)
+tts.set_gap(0)
 # Set pitch 0-99, default 80
 tts.set_pitch(99)
 
