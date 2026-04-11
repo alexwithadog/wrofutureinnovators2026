@@ -21,7 +21,7 @@ class MuseumHelmet:
         self.stt = STT(language="en-us")
 
         # Piper settings
-        self.piper_model = "fr_FR-siwis-medium"
+        self.piper_model = "en_US-ryan-medium"
         self.piper_data_dir = os.path.expanduser("~/piper_voices")
 
         # Wake word
