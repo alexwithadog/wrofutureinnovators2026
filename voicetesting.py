@@ -24,5 +24,41 @@ tts = Pico2Wave()
 tts.set_lang('en-US')  # en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
 
 # Quick hello (sanity check)
-tts.say("Hello! I'm Pico2Wave TTS.")
-print("done")
+tts.say("HELLO! THIS IS THE ENLGISH US")
+print("en-us")
+
+# Set the language
+tts.set_lang('en-GB')  # en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
+
+# Quick hello (sanity check)
+tts.say("HELLO! THIS IS ENLGISH GB")
+print("en-gb")
+
+# Set the language
+tts.set_lang('de-DE')  # en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
+
+# Quick hello (sanity check)
+tts.say("HELLO! THIS IS DELIMITED DELTA")
+print("de-DE")
+
+# Set the language
+tts.set_lang('es-ES')  # en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
+
+# Quick hello (sanity check)
+tts.say("HELLO! THIS IS SPANISH ESPANOL")
+print("es-ES")
+
+# Set the language
+tts.set_lang('fr-FR')  # en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
+
+# Quick hello (sanity check)
+tts.say("HELLO! THIS IS FRENCH LANGUAGE")
+tts.say("BONJOUR JE M'APPELLE ATLAS")
+print("fr-FR")
+
+# Set the language
+tts.set_lang('it-IT')  # en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
+
+# Quick hello (sanity check)
+tts.say("HELLO THIS IS IT bUT noT IT")
+print("it-IT")
