@@ -6,14 +6,14 @@ tts = Espeak()
 # Set amplitude 0-200, default 100
 tts.set_amp(200)
 # Set speed 80-260, default 150
-tts.set_speed(150)
+tts.set_speed(80)
 # Set gap 0-200, default 1
-tts.set_gap(1)
+tts.set_gap(2)
 # Set pitch 0-99, default 80
-tts.set_pitch(80)
+tts.set_pitch(50)
 
 tts.say("Hello! I’m Espeak TTS.")
-
+"""
 
 from fusion_hat.tts import Pico2Wave
 
@@ -62,3 +62,4 @@ tts.set_lang('it-IT')  # en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
 # Quick hello (sanity check)
 tts.say("HELLO THIS IS IT bUT noT IT")
 print("it-IT")
+"""
