@@ -11,14 +11,14 @@ picam2.configure("preview")
 picam2.start()
 
 # Load YOLOv8
-model = YOLO("yolov10x.pt")
+model = YOLO("yolov8n.pt")
 
 while True:
     # Capture a frame from the camera
     frame = picam2.capture_array()
     
     # Run YOLO model on the captured frame and store the results
-    results = model.predict(frame, imgsz=320)
+    results = model.predict(frame, imgsz=160)
     
     # Output the visual detection data, we will draw this on our camera preview window
     annotated_frame = results[0].plot()
