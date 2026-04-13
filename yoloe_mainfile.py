@@ -293,91 +293,91 @@ Keep it short, around 1 to 3 short sentences.
             self.object_first_seen_time = current_time
 
     def camera_worker(self) -> None:
-    try:
-        picam2 = Picamera2()
-        picam2.preview_configuration.main.size = self.camera_size
-        picam2.preview_configuration.main.format = "RGB888"
-        picam2.preview_configuration.align()
-        picam2.configure("preview")
-        picam2.start()
-        time.sleep(0.2)
-
-        # Show raw camera preview immediately
-        preview_start = time.time()
-        while time.time() - preview_start < 1.0 and not self.stop_camera_event.is_set():
-            frame = picam2.capture_array()
-            cv2.imshow("YOLOE Museum Helmet", frame)
-            if cv2.waitKey(1) == ord("q"):
-                self.stop_camera_event.set()
-                return
-
-        print("[Camera] Preview opened, loading YOLOE model...")
-
-        model = YOLOE(self.model_path)
-        model.set_classes(self.prompt_names)
-
-        print("[Camera] YOLOE model loaded.")
-
-        while not self.stop_camera_event.is_set():
-            frame = picam2.capture_array()
-
-            results = model.predict(frame, imgsz=self.model_imgsz)
-            result = results[0]
-
-            annotated_frame = result.plot(boxes=True, masks=False)
-
-            # Build a clean detection list above threshold
-            detections: list[dict] = []
-            boxes = result.boxes
-            if boxes is not None and boxes.cls is not None and boxes.conf is not None:
-                class_ids = boxes.cls.tolist()
-                confidences = boxes.conf.tolist()
-
-                for cls_id, conf in zip(class_ids, confidences):
-                    if conf < self.confidence_threshold:
-                        continue
-                    cls_index = int(cls_id)
-                    name = result.names.get(cls_index, str(cls_index))
-                    detections.append({
-                        "name": str(name).lower(),
-                        "confidence": float(conf),
-                    })
-
-            self.maybe_trigger_object_explanation(detections)
-
-            # FPS overlay
-            inference_time = result.speed["inference"]
-            fps = 1000 / inference_time if inference_time > 0 else 0.0
-            text = f"FPS: {fps:.1f}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            text_size = cv2.getTextSize(text, font, 1, 2)[0]
-            text_x = annotated_frame.shape[1] - text_size[0] - 10
-            text_y = text_size[1] + 10
-            cv2.putText(
-                annotated_frame,
-                text,
-                (text_x, text_y),
-                font,
-                1,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            cv2.imshow("YOLOE Museum Helmet", annotated_frame)
-
-            if cv2.waitKey(1) == ord("q"):
-                self.stop_camera_event.set()
-                break
-
-    except Exception as e:
-        print("Camera worker error:", e)
-    finally:
         try:
-            picam2.stop()
-        except Exception:
-            pass
-        cv2.destroyAllWindows()
+            picam2 = Picamera2()
+            picam2.preview_configuration.main.size = self.camera_size
+            picam2.preview_configuration.main.format = "RGB888"
+            picam2.preview_configuration.align()
+            picam2.configure("preview")
+            picam2.start()
+            time.sleep(0.2)
+
+            # Show raw camera preview immediately
+            preview_start = time.time()
+            while time.time() - preview_start < 1.0 and not self.stop_camera_event.is_set():
+                frame = picam2.capture_array()
+                cv2.imshow("YOLOE Museum Helmet", frame)
+                if cv2.waitKey(1) == ord("q"):
+                    self.stop_camera_event.set()
+                    return
+
+            print("[Camera] Preview opened, loading YOLOE model...")
+
+            model = YOLOE(self.model_path)
+            model.set_classes(self.prompt_names)
+
+            print("[Camera] YOLOE model loaded.")
+
+            while not self.stop_camera_event.is_set():
+                frame = picam2.capture_array()
+
+                results = model.predict(frame, imgsz=self.model_imgsz)
+                result = results[0]
+
+                annotated_frame = result.plot(boxes=True, masks=False)
+
+                # Build a clean detection list above threshold
+                detections: list[dict] = []
+                boxes = result.boxes
+                if boxes is not None and boxes.cls is not None and boxes.conf is not None:
+                    class_ids = boxes.cls.tolist()
+                    confidences = boxes.conf.tolist()
+
+                    for cls_id, conf in zip(class_ids, confidences):
+                        if conf < self.confidence_threshold:
+                            continue
+                        cls_index = int(cls_id)
+                        name = result.names.get(cls_index, str(cls_index))
+                        detections.append({
+                            "name": str(name).lower(),
+                            "confidence": float(conf),
+                        })
+
+                self.maybe_trigger_object_explanation(detections)
+
+                # FPS overlay
+                inference_time = result.speed["inference"]
+                fps = 1000 / inference_time if inference_time > 0 else 0.0
+                text = f"FPS: {fps:.1f}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                text_size = cv2.getTextSize(text, font, 1, 2)[0]
+                text_x = annotated_frame.shape[1] - text_size[0] - 10
+                text_y = text_size[1] + 10
+                cv2.putText(
+                    annotated_frame,
+                    text,
+                    (text_x, text_y),
+                    font,
+                    1,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                cv2.imshow("YOLOE Museum Helmet", annotated_frame)
+
+                if cv2.waitKey(1) == ord("q"):
+                    self.stop_camera_event.set()
+                    break
+
+        except Exception as e:
+            print("Camera worker error:", e)
+        finally:
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+            cv2.destroyAllWindows()
 
     def handle_command(self, text: str) -> bool:
         print(f"\n[Heard]: {text}")
