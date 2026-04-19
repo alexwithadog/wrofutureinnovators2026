@@ -145,7 +145,7 @@ Always sound like a helpful museum guide beside the visitor, not an audio encycl
             result_queue.put({"error": str(e)})
 
     def listen_once(self, silence_timeout: int = 3) -> str:
-        print("🎤 Listening...")
+        print("Listening...")
 
         result_queue: queue.Queue = queue.Queue()
         stop_event = threading.Event()
