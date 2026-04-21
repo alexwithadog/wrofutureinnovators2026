@@ -56,7 +56,7 @@ vosk.SetLogLevel(-1)
 
 # --- Audio I/O ---
 # Mic: see `arecord -l`. Currently card 3 = USB ENC Audio Device (MillSO).
-MIC_DEVICE = "plughw:3,0"
+MIC_DEVICE = 1
 MIC_SAMPLE_RATE = 16000         # Vosk wants 16 kHz. plughw handles conversion.
 MIC_BLOCKSIZE = 4000            # frames per callback, ~0.25 s at 16 kHz
 
