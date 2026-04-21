@@ -113,7 +113,7 @@ class MuseumHelmet:
         self.confidence_threshold = 0.20
         self.object_hold_seconds = 2
         self.object_cooldown_seconds = 8.0
-        self.model_imgsz = 160  # lower for more FPS; raise for more detail
+        self.model_imgsz = 300  # lower for more FPS; raise for more detail
 
         # Detection tracking
         self.last_seen_object = None
