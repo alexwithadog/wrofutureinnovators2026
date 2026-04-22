@@ -114,7 +114,7 @@ class MuseumHelmet:
         # --- AI setup ---
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         self.client = genai.Client(api_key=self.gemini_api_key)
-        self.gemini_model = "gemini-2.5-flash"
+        self.gemini_model = "gemini-2.5-flash-lite"
 
         # --- Vosk STT ---
         if not os.path.isdir(VOSK_MODEL_PATH):
