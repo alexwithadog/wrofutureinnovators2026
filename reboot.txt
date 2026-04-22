@@ -1,0 +1,138 @@
+Here's the full setup from a fresh clone. I'll order it so you can just work top to bottom.
+
+## Fresh clone + venv
+
+```bash
+cd ~
+git clone https://github.com/alexwithadog/wrofutureinnovators2026.git
+cd wrofutureinnovators2026
+
+# Recreate the venv. --system-site-packages is important because picamera2
+# and libcamera are installed at the system level and can't easily be pip-installed.
+python3 -m venv --system-site-packages yolo-runtime
+source yolo-runtime/bin/activate
+```
+
+## System packages (apt — outside the venv, one time only)
+
+These are the non-Python bits. Some you probably already have from earlier in the project, but running it is harmless — apt skips anything already installed.
+
+```bash
+sudo apt update
+sudo apt install -y \
+    alsa-utils \
+    libportaudio2 \
+    python3-dev \
+    build-essential
+```
+
+What each is for:
+- `alsa-utils` → `aplay`, `arecord`, `speaker-test`
+- `libportaudio2` → runtime for `sounddevice` / PortAudio
+- `python3-dev` + `build-essential` → in case any pip package needs to compile
+
+You should already have `picamera2`, `libcamera`, and the Fusion HAT audio setup from the earlier setup; we're not touching those.
+
+## Python packages (pip — inside the venv)
+
+```bash
+pip install --upgrade pip
+pip install \
+    google-genai \
+    python-dotenv \
+    vosk \
+    sounddevice \
+    numpy \
+    opencv-python \
+    ultralytics \
+    piper-tts
+```
+
+What each is for:
+- `google-genai` → Gemini API client
+- `python-dotenv` → reads your `.env` file for the API key
+- `vosk` → offline STT
+- `sounddevice` → audio capture from USB mic
+- `numpy` → audio buffer processing + general
+- `opencv-python` → camera preview, overlays
+- `ultralytics` → YOLOE vision model
+- `piper-tts` → offline TTS (this is what `python3 -m piper` invokes)
+
+**Note:** `torch` is what `ultralytics` depends on and should install automatically as a dependency. If it doesn't, add `torch` to the pip install list. On Pi it'll install the CPU-only wheel.
+
+## Files you need to restore manually (not in git)
+
+These are outside the repo and didn't get wiped by the clone:
+
+**1. `.env` file with your Gemini API key** — put it in the repo root:
+
+```bash
+echo "GEMINI_API_KEY=your_actual_key_here" > ~/wrofutureinnovators2026/.env
+```
+
+**2. YOLOE model weights** (`yoloe-11s-seg.pt`) — should be in the repo root alongside `CLAUDE2.py`. If it's missing, ultralytics will auto-download on first run (takes a minute).
+
+**3. Vosk model** — you already have this at `/opt/vosk_models/vosk-model-small-en-us-0.15`. Verify:
+
+```bash
+ls /opt/vosk_models/vosk-model-small-en-us-0.15
+```
+
+**4. Piper voice** — you already have this too. Verify:
+
+```bash
+ls ~/piper_voices
+```
+
+Should show `en_US-ryan-medium.onnx` and `en_US-ryan-medium.onnx.json`. If the current code uses a different voice (like `en_US-lessac-medium`), download it:
+
+```bash
+python3 -m piper.download_voices en_US-lessac-medium --data-dir ~/piper_voices
+```
+
+## Sanity checks before running
+
+All inside the venv:
+
+```bash
+# Python imports should all succeed
+python3 -c "import cv2, numpy, sounddevice, vosk, google.genai, dotenv; print('OK')"
+
+# Camera visible
+python3 -c "from picamera2 import Picamera2; print('picamera2 OK')"
+
+# YOLOE loads
+python3 -c "from ultralytics import YOLOE; print('YOLOE OK')"
+
+# Piper voice exists
+ls ~/piper_voices/
+
+# Audio devices visible
+python3 -c "import sounddevice as sd; print(sd.query_devices())"
+
+# Vosk model exists
+ls /opt/vosk_models/
+```
+
+**Confirm these numbers haven't shifted:**
+- Mic device should still be **index 1** (USB ENC Audio Device)
+- Speaker should still be **card 4** (UACDemoV1.0) — verify with `aplay -l`
+
+If either has moved, update `MIC_DEVICE` and `AUDIO_OUT_DEVICE` at the top of `CLAUDE2.py` before running.
+
+## Run it
+
+```bash
+cd ~/wrofutureinnovators2026
+source yolo-runtime/bin/activate
+python3 CLAUDE2.py
+```
+
+## If something's broken
+
+- **`ModuleNotFoundError: picamera2`** → you forgot `--system-site-packages` on the venv. Delete `yolo-runtime/`, recreate with the flag.
+- **`No module named 'google.genai'`** → `pip install google-genai` (hyphenated, not underscore).
+- **`ultralytics` pulls in a torch version that breaks picamera2's numpy** → tell me, we've seen this before; fix is pinning numpy.
+- **Mic/speaker indexes shifted** → re-run `sd.query_devices()` and `aplay -l`, update constants.
+
+Send me any errors that come up. Also — after you've run it fresh, let me know which version of `CLAUDE2.py` you want to test first (the "one-shot full response" version I wrote last).
