@@ -164,8 +164,8 @@ class MuseumHelmet:
         self.camera_size = CAMERA_PREVIEW_SIZE
         self.model_path = "yoloe-11s-seg.pt"
         self.prompt_names = [
-            "vase",
-            "person", "pharaoh mask", "royal crown", " bone", " starry night van gogh", "statue", "diamonds", "shiny"
+            "vase","mona lisa ", "cement","head"
+            "pharaoh mask", "royal crown", " bone", " starry night van gogh painting ", "statue", "diamonds", "shiny"
         ]
         self.detect_confidence_threshold = DETECT_CONFIDENCE_THRESHOLD
         self.model_imgsz = 192
