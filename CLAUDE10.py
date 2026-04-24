@@ -91,7 +91,7 @@ MEMORY_TURNS = 10
 DETECT_EVERY_N_FRAMES = 4
 OBJECT_HOLD_SECONDS = 2.0
 OBJECT_COOLDOWN_SECONDS = 8.0
-TRIGGER_OBJECTS = {"mona lisa painting", "vase", "sword"}
+TRIGGER_OBJECTS = {, "vase", "sword"}
 DETECT_CONFIDENCE_THRESHOLD = 0.50
 TRIGGER_CONFIDENCE_THRESHOLD = 0.50
 
@@ -164,7 +164,7 @@ class MuseumHelmet:
         self.camera_size = CAMERA_PREVIEW_SIZE
         self.model_path = "yoloe-11s-seg.pt"
         self.prompt_names = [
-            "mona lisa painting", "vase", "sword",
+            "vase", "sword",
             "person", "face", "hand", "background wall", "pharaoh mask", "crown", " bone", " starry night ", "statue"
         ]
         self.detect_confidence_threshold = DETECT_CONFIDENCE_THRESHOLD
