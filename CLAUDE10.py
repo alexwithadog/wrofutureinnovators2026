@@ -165,7 +165,7 @@ class MuseumHelmet:
         self.model_path = "yoloe-11s-seg.pt"
         self.prompt_names = [
             "mona lisa painting", "vase", "sword",
-            "person", "face", "hand", "background wall", "pharaoh mask", ""
+            "person", "face", "hand", "background wall", "pharaoh mask", "crown", " bone", " starry night ", "statue"
         ]
         self.detect_confidence_threshold = DETECT_CONFIDENCE_THRESHOLD
         self.model_imgsz = 192
