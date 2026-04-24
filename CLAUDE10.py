@@ -78,8 +78,8 @@ MEMORY_TURNS = 10
 
 # --- Vision ---
 DETECT_EVERY_N_FRAMES = 4
-OBJECT_HOLD_SECONDS = 2.0
-OBJECT_COOLDOWN_SECONDS = 8.0
+OBJECT_HOLD_SECONDS = 1.5
+OBJECT_COOLDOWN_SECONDS = 3.0
 TRIGGER_OBJECTS = {"vase", "sword", "pharaoh mask", "mona lisa"}
 OBJECT_PRIORITY = {
     "pharaoh mask": 1,
@@ -102,9 +102,9 @@ GEMINI_MODEL_FALLBACK = "gemini-2.5-flash-lite"
 ACK_DELAY_SECONDS = 1
 # Acknowledgment phrases (pre-rendered). Random first-try choice.
 ACK_FIRST_TRY_PHRASES = [
-    "Let me think.",
-    "One moment.",
-    "Good question.",
+    "Hmmmm... let me think for a second please",
+    "One moment please, let me think",
+    " Let me think for a moment, please wait."
 ]
 ACK_SECOND_TRY_PHRASE = "Sorry, one second, let me think."
 FAILURE_PHRASE = "There's a problem with the connection right now. Please try again in a moment."
