@@ -94,7 +94,7 @@ CAMERA_PREVIEW_SIZE = (1200, 1200)
 CAMERA_FLIP_180 = True
 
 
-GEMINI_MODEL_PRIMARY = "gemini-2.5-flash"
+GEMINI_MODEL_PRIMARY = "gemini-2.5-flash-lite"
 GEMINI_MODEL_FALLBACK = "gemini-2.5-flash-lite"
 
 ACK_DELAY_SECONDS = 1
