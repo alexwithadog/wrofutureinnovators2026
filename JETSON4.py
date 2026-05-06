@@ -502,10 +502,18 @@ Give a short natural museum-guide explanation. Do not mention detection. Keep it
 
             while not self.stop_event.is_set():
                 ret, frame = cap.read()
-
                 if not ret:
                     continue
 
+                raw = frame[:, :, 0] if len(frame.shape) == 3 else frame
+                raw8 = cv2.convertScaleAbs(raw, alpha=255.0 / 1023.0)
+                frame = cv2.cvtColor(raw8, cv2.COLOR_BAYER_RGGB2BGR)
+
+                if CAMERA_FLIP_180:
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
+                if not ret:
+                    continue
+                frame = cv2.resize(frame, CAMERA_PROCESS_SIZE)
                 if CAMERA_FLIP_180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
 
