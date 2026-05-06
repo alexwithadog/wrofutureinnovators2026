@@ -636,11 +636,11 @@ Keep it to 1 to 2 short sentences.
                     cv2.LINE_AA,
                 )
 
-                cv2.imshow("YOLOE Museum Helmet", display)
+                #cv2.imshow("YOLOE Museum Helmet", display)
 
-                if cv2.waitKey(1) == ord("q"):
-                    self.stop_event.set()
-                    break
+                #if cv2.waitKey(1) == ord("q"):
+                #   self.stop_event.set()
+                #    break
 
         except Exception as e:
             print("Camera worker error:", e)
