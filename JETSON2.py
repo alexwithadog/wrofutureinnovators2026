@@ -34,7 +34,7 @@ MIC_DEVICE = None
 MIC_NATIVE_RATE = 48000
 MIC_SAMPLE_RATE = 16000
 MIC_BLOCKSIZE = 12000
-AUDIO_OUT_DEVICE: str | None = None
+AUDIO_OUT_DEVICE: str | None = "plughw:2,0"
 
 VOSK_MODEL_PATH = "/opt/vosk_models/vosk-model-small-en-us-0.15"
 PIPER_VOICE = "en_US-ryan-low"
