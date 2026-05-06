@@ -227,7 +227,7 @@ Everything you write will be spoken aloud, so write plain spoken prose only.
         finally:
             self.is_busy_event.clear()
             self.last_speak_end_time = time.time()
-              def _hard_stop_all_audio(self):
+    def _hard_stop_all_audio(self):
         for p in (self._piper_proc, self._aplay_proc):
             if p and p.poll() is None:
                 p.terminate()
