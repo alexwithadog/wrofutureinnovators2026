@@ -30,7 +30,7 @@ except Exception:
 
 vosk.SetLogLevel(-1)
 
-MIC_DEVICE = 29
+MIC_DEVICE = None
 MIC_NATIVE_RATE = 48000
 MIC_SAMPLE_RATE = 16000
 MIC_BLOCKSIZE = 12000
