@@ -685,14 +685,18 @@ This is NOT a bystander event — never reply SKIP for a camera event.
     def camera_worker(self) -> None:
         cap = None
         try:
-            cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
-            if not cap.isOpened():
-                raise RuntimeError(f"Camera failed to open at {CAMERA_DEVICE}")
-
-            # Ask V4L2 for a smaller native size — much faster than reading
-            # full 4608x2592 every frame.
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_CAPTURE_SIZE[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_CAPTURE_SIZE[1])
+            gst_pipeline = (
+    "nvarguscamerasrc sensor-id=0 ! "
+    "video/x-raw(memory:NVMM),width=1536,height=864,framerate=30/1 ! "
+    "nvvidconv flip-method=0 ! "
+    "video/x-raw,format=BGRx ! "
+    "videoconvert ! "
+    "video/x-raw,format=BGR ! "
+    "appsink drop=true max-buffers=2"
+)
+cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+if not cap.isOpened():
+    raise RuntimeError("Camera failed to open via GStreamer pipeline")
 
             ret, test_frame = cap.read()
             if not ret:
