@@ -553,7 +553,7 @@ Keep it to 1 to 2 short sentences.
         return sum(confs) / len(confs)
 
     def camera_worker(self) -> None:
-    cap = None
+        cap = None
 
     try:
         cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
