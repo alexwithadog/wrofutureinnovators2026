@@ -104,7 +104,7 @@ CAMERA_PROCESS_SIZE = (1024, 1024)   # final size YOLOE sees
 YOLOE_IMGSZ = 320
 
 # IMX708 driver desaturates; boost in HSV. 1.0 = no change. 1.6 ≈ +60%.
-SATURATION_BOOST = 2
+SATURATION_BOOST = 5
 
 # --- Gemini ---
 GEMINI_MODEL_PRIMARY = "gemini-2.5-flash"
