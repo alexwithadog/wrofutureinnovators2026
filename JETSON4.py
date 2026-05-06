@@ -506,9 +506,12 @@ Give a short natural museum-guide explanation. Do not mention detection. Keep it
                     continue
 
                 raw = frame[:, :, 0] if len(frame.shape) == 3 else frame
-                raw8 = cv2.convertScaleAbs(raw, alpha=255.0 / 1023.0)
-                frame = cv2.cvtColor(raw8, cv2.COLOR_BAYER_RGGB2BGR)
 
+                raw = raw.astype(np.float32)
+                raw = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX)
+                raw8 = raw.astype(np.uint8)
+
+                frame = cv2.cvtColor(raw8, cv2.COLOR_BAYER_RGGB2BGR)
                 if CAMERA_FLIP_180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
                 if not ret:
