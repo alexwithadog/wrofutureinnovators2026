@@ -43,7 +43,7 @@ vosk.SetLogLevel(-1)
 # --------------------------------------------------------------------------
 
 # --- Audio input (mic) ---
-MIC_DEVICE = 0           # USB ENC Audio Device on this flash (sounddevice index)
+MIC_DEVICE = 1           # USB ENC Audio Device on this flash (sounddevice index)
 MIC_CHANNELS = 2         # mic is stereo; we downmix to mono in code
 MIC_NATIVE_RATE = 48000
 MIC_SAMPLE_RATE = 16000  # what Vosk expects
