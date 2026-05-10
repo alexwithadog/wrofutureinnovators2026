@@ -30,10 +30,10 @@ from collections import deque
 
 import cv2
 import numpy as np
-import sounddevice as sd
+import sounddevice as sd # type: ignore
 import vosk  # type: ignore
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv # type: ignore
 from google import genai
 from ultralytics import YOLOE  # type: ignore
 
