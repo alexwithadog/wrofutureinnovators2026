@@ -3,27 +3,15 @@ ATLAS — Museum Helmet main script for Jetson Orin Nano.
 Multilanguage edition: English / French / Spanish.
 
 Hardware:
-  - Jetson Orin Nano (JetPack 6.1, CUDA 12.6)
-  - Raspberry Pi Camera Module 3 (IMX708) via NVIDIA Argus / GStreamer
-  - USB MillSO mic on sounddevice index 1 (hw:1,0)
+  - Jetson Orin Nano (JetPack 6.x, CUDA 12.6)
+  - USB webcam (HD Camera, MJPG @ 1280x720, /dev/video0)
+  - USB mic on sounddevice index 0 (hw:1,0), stereo input, downmixed to mono
   - USB speaker on plughw:0,0 (UACDemoV1.0)
 
-Multilanguage:
-  - Three languages defined in LANGUAGES dict at top.
-  - Active language has its own Vosk model and Piper voice.
-  - Switch via spoken commands. Each language has both NATIVE switch phrases
-    (which work reliably while in that language) AND foreign-language phrases
-    (which may or may not match — depends on Vosk's transcription).
-  - Same for exit phrases: each language has its own.
-  - Phrase matching is accent-insensitive (Vosk often drops accents anyway).
-  - Gemini is told the active language and replies in it.
-  - Ack WAVs are pre-rendered in all 3 languages at startup.
-
-Camera notes (IMX708 quirks):
-  - Only sensor-mode 0 (4608x2592 @ 14fps) has correct ISP tuning.
-  - Driver delivers desaturated colors; we boost saturation in OpenCV.
-  - Brightness adjustable via Argus exposurecompensation OR software HSV V.
-  - GPU downscales 4608x2592 -> 1280x720 in nvvidconv before Python sees it.
+Notes after the reflash:
+  - PulseAudio is masked. Audio uses raw ALSA via aplay.
+  - Camera is plain V4L2 + OpenCV. No GStreamer / nvargus / IMX708 pipeline.
+  - Mic is stereo on this flash; we capture stereo and take left channel.
 """
 
 import json
@@ -55,9 +43,10 @@ vosk.SetLogLevel(-1)
 # --------------------------------------------------------------------------
 
 # --- Audio input (mic) ---
-MIC_DEVICE = 1
+MIC_DEVICE = 1           # USB ENC Audio Device on this flash (sounddevice index)
+MIC_CHANNELS = 2         # mic is stereo; we downmix to mono in code
 MIC_NATIVE_RATE = 48000
-MIC_SAMPLE_RATE = 16000
+MIC_SAMPLE_RATE = 16000  # what Vosk expects
 MIC_BLOCKSIZE = 12000
 
 # --- Audio output (speaker) ---
@@ -73,17 +62,17 @@ LANGUAGES: dict[str, dict] = {
         "vosk_model": "/opt/vosk_models/vosk-model-small-en-us-0.15",
         "piper_voice": "en_US-ryan-low",
         "switch_phrases": [
-            # English commands (most reliable when in English mode)
-            "switch to english", "speak english", "english please", "in english","switched to english", "1 1", "one one"
+            # English commands
+            "switch to english", "speak english", "english please", "in english",
             # French phrases for switching TO English (if French is active)
             "passez a l anglais", "passe a l anglais", "passe en anglais",
-            "passez en anglais", "parle anglais", "en anglais", " 2 1", "deux un"
+            "passez en anglais", "parle anglais", "en anglais",
             # Spanish phrases for switching TO English (if Spanish is active)
             "cambia al ingles", "cambiar al ingles", "habla ingles",
-            "en ingles", "ingles por favor", " 3 1", "tres uno"
+            "en ingles", "ingles por favor",
         ],
         "exit_phrases": [
-            "goodbye", "good bye", "exit", "quit", "stop program", "see you", " 4 4", "four four"
+            "goodbye", "good bye", "exit", "quit", "stop program", "see you",
         ],
         "ack_first": [
             "Let me think.",
@@ -104,13 +93,10 @@ LANGUAGES: dict[str, dict] = {
         "vosk_model": "/opt/vosk_models/vosk-model-small-fr-0.22",
         "piper_voice": "fr_FR-siwis-medium",
         "switch_phrases": [
-            # French commands (most reliable when in French mode)
             "passez au francais", "passe au francais", "passe en francais",
             "passez en francais", "parle francais", "en francais",
             "francais s il vous plait",
-            # English phrases for switching TO French
             "switch to french", "speak french", "french please", "in french",
-            # Spanish phrases for switching TO French
             "cambia al frances", "cambiar al frances", "habla frances",
             "en frances", "frances por favor",
         ],
@@ -137,13 +123,10 @@ LANGUAGES: dict[str, dict] = {
         "vosk_model": "/opt/vosk_models/vosk-model-small-es-0.42",
         "piper_voice": "es_MX-claude-high",
         "switch_phrases": [
-            # Spanish commands (most reliable when in Spanish mode)
             "cambia al espanol", "cambiar al espanol", "habla espanol",
             "en espanol", "espanol por favor",
             "pasa al espanol", "pasar al espanol",
-            # English phrases for switching TO Spanish
             "switch to spanish", "speak spanish", "spanish please", "in spanish",
-            # French phrases for switching TO Spanish
             "passez a l espagnol", "passe a l espagnol", "passe en espagnol",
             "parle espagnol", "en espagnol",
         ],
@@ -170,7 +153,7 @@ LANGUAGES: dict[str, dict] = {
 
 DEFAULT_LANGUAGE = "english"
 
-# --- Vosk shared ---
+# --- STT shared ---
 STT_MIN_WORDS = 3
 STT_MIN_SECONDS = 1.0
 VOSK_MIN_CONF = 0.55
@@ -183,25 +166,26 @@ WAKE_WORDS = ("atlas", "helmet", "guide", "assistant")
 MEMORY_TURNS = 10
 
 # --- Vision ---
-DETECT_EVERY_N_FRAMES = 1
+DETECT_EVERY_N_FRAMES = 2
 OBJECT_HOLD_SECONDS = 2.0
 OBJECT_COOLDOWN_SECONDS = 8.0
 TRIGGER_OBJECTS = {"mona lisa painting", "vase", "sword", "pharaoh mask"}
 DETECT_CONFIDENCE_THRESHOLD = 0.40
 TRIGGER_CONFIDENCE_THRESHOLD = 0.50
 
-# --- Camera ---
-CAMERA_FLIP = 2
-CAMERA_GST_WIDTH = 4608
-CAMERA_GST_HEIGHT = 2592
-CAMERA_GST_FRAMERATE = 14
-CAMERA_GST_SENSOR_MODE = 0
-CAMERA_PROCESS_SIZE = (1024, 1024)
+# --- USB Camera ---
+CAMERA_INDEX = 0                      # /dev/video0
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 30
+# Set to one of:
+#   None                          -> no rotation
+#   cv2.ROTATE_90_CLOCKWISE       -> 90° clockwise
+#   cv2.ROTATE_180                -> upside down -> rotate 180°
+#   cv2.ROTATE_90_COUNTERCLOCKWISE
+CAMERA_ROTATION = None
+CAMERA_PROCESS_SIZE = (1024, 1024)    # final size YOLOE sees
 YOLOE_IMGSZ = 320
-
-CAMERA_EXPOSURE_COMP = 1.0
-SATURATION_BOOST = 1.6
-BRIGHTNESS_BOOST = 1.0
 
 # --- Gemini ---
 GEMINI_MODEL_PRIMARY = "gemini-2.5-flash"
@@ -243,22 +227,6 @@ def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
         return False
 
 
-def _build_camera_pipeline() -> str:
-    """GStreamer pipeline for IMX708 via Argus (sensor-mode 0 only — others broken)."""
-    return (
-        f"nvarguscamerasrc sensor-id=0 sensor-mode={CAMERA_GST_SENSOR_MODE} "
-        f"wbmode=1 aelock=false ee-mode=1 tnr-mode=1 "
-        f"exposurecompensation={CAMERA_EXPOSURE_COMP} ! "
-        f"video/x-raw(memory:NVMM),width={CAMERA_GST_WIDTH},height={CAMERA_GST_HEIGHT},"
-        f"framerate={CAMERA_GST_FRAMERATE}/1 ! "
-        f"nvvidconv flip-method={CAMERA_FLIP} ! "
-        f"video/x-raw,width=1280,height=720,format=BGRx ! "
-        f"videoconvert ! "
-        f"video/x-raw,format=BGR ! "
-        f"appsink drop=true max-buffers=2"
-    )
-
-
 class MuseumHelmet:
     def __init__(self):
         load_dotenv()
@@ -269,14 +237,12 @@ class MuseumHelmet:
             raise RuntimeError("GEMINI_API_KEY not set. Put it in .env.")
         self.client = genai.Client(api_key=self.gemini_api_key)
 
-        # --- Vosk: load ALL language models at startup so switching is fast ---
+        # --- Vosk: load ALL language models at startup ---
         self.vosk_models: dict[str, vosk.Model] = {}
         for lang_name, cfg in LANGUAGES.items():
             path = cfg["vosk_model"]
             if not os.path.isdir(path):
-                raise RuntimeError(
-                    f"Vosk model for {lang_name} not found at {path}."
-                )
+                raise RuntimeError(f"Vosk model for {lang_name} not found at {path}.")
             print(f"[STT] Loading Vosk model for {lang_name} from {path} ...")
             self.vosk_models[lang_name] = vosk.Model(path)
         print("[STT] All Vosk models loaded.")
@@ -291,7 +257,7 @@ class MuseumHelmet:
         self.prompt_names = [
             # Triggerable artifacts
             "mona lisa painting", "vase", "sword", "pharaoh mask",
-            # Distractors so YOLOE has somewhere to put non-artifact objects
+            # Distractors
             "person", "face", "hand", "background wall",
         ]
         self.yoloe_imgsz = YOLOE_IMGSZ
@@ -325,7 +291,7 @@ class MuseumHelmet:
 
         # --- System prompt ---
         self.system_prompt = """
-You are Atlas, an AI museum guide embedded in a wearable helmet, speaking directly to a visitor in front of an exhibit. You also have a secondary, non-intrusive safety role.
+You are Atlas, an AI museum guide embedded in a wearable helmet, speaking directly to a visitor in front of an exhibit.
 
 Personality & Style
 Speak warmly, naturally, and conversationally — like a real human guide.
@@ -357,7 +323,6 @@ If something may be misidentified, acknowledge uncertainty and still provide hel
 Vary phrasing to avoid sounding repetitive.
 
 Privacy & Safety
-Keep the safety role subtle and secondary.
 Never mention storing, tracking, or saving personal data.
 """
 
@@ -469,9 +434,7 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
                 return
             print(f"[Lang] switching {self.current_language} -> {new_lang}")
             self.current_language = new_lang
-        # Tell STT loop to reload its recognizer with the new model.
         self.language_change_event.set()
-        # Speak confirmation in the new language.
         self.is_busy_event.set()
         self.speak_start_time = time.time()
         try:
@@ -483,7 +446,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
             self.last_speak_end_time = time.time()
 
     def _detect_switch_command(self, text: str) -> str | None:
-        """Return the language to switch to if `text` matches a switch phrase, else None."""
         normalized = _strip_accents(text)
         for lang_name, cfg in LANGUAGES.items():
             for phrase in cfg["switch_phrases"]:
@@ -492,7 +454,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
         return None
 
     def _is_exit_phrase(self, text: str) -> bool:
-        """Check if text matches any exit phrase in the ACTIVE language."""
         normalized = _strip_accents(text)
         cfg = LANGUAGES[self._get_active_language()]
         for phrase in cfg.get("exit_phrases", []):
@@ -614,7 +575,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
             except Exception as e:
                 result_holder[key] = ("err", str(e))
 
-        # Phase 1: primary, with first-try ack if slow.
         t1 = threading.Thread(target=attempt, args=(GEMINI_MODEL_PRIMARY, "t1"), daemon=True)
         t1.start()
 
@@ -635,7 +595,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
             return (payload, "ok")
         print(f"[Gemini] primary attempt 1 failed/empty: {payload[:120] if payload else '(empty)'}")
 
-        # Phase 2: retry primary with second ack.
         if ack_enabled:
             second_wav = self._ack_wavs.get(self._get_active_language(), {}).get("second_try")
             if second_wav:
@@ -650,7 +609,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
         except Exception as e:
             print(f"[Gemini] primary attempt 2 failed: {e}")
 
-        # Phase 3: silent fallback to lite.
         try:
             print(f"[Gemini] falling back to {GEMINI_MODEL_FALLBACK}")
             text = self._gemini_try_once(GEMINI_MODEL_FALLBACK, prompt)
@@ -790,7 +748,7 @@ This is NOT a bystander event — never reply SKIP for a camera event.
             self._handle_request(req.get("kind"), req.get("text", ""))
 
     # --------------------------------------------------------------------
-    # STT — reloads recognizer when language changes.
+    # STT — reloads recognizer when language changes. Stereo -> mono.
     # --------------------------------------------------------------------
     def _listen_forever(self) -> None:
         audio_q: queue.Queue = queue.Queue()
@@ -805,6 +763,10 @@ This is NOT a bystander event — never reply SKIP for a camera event.
             if (time.time() - self.last_speak_end_time) < POST_SPEAK_SETTLE_SECONDS:
                 return
             samples = np.frombuffer(bytes(indata), dtype=np.int16)
+            # Downmix stereo -> mono (Vosk wants mono).
+            if MIC_CHANNELS > 1:
+                samples = samples.reshape(-1, MIC_CHANNELS)
+                samples = samples[:, 0].copy()
             if decim > 1:
                 samples = samples[::decim]
             audio_q.put(samples.tobytes())
@@ -821,12 +783,12 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                     samplerate=MIC_NATIVE_RATE,
                     blocksize=MIC_BLOCKSIZE,
                     dtype="int16",
-                    channels=1,
+                    channels=MIC_CHANNELS,
                     device=MIC_DEVICE,
                     callback=audio_callback,
                 ):
                     print(f"[STT] Listening in {active_lang} on device {MIC_DEVICE} "
-                          f"@ {MIC_NATIVE_RATE} Hz -> {MIC_SAMPLE_RATE} Hz")
+                          f"({MIC_CHANNELS}ch) @ {MIC_NATIVE_RATE} Hz -> {MIC_SAMPLE_RATE} Hz")
 
                     utt_start: float | None = None
                     was_busy = False
@@ -893,24 +855,28 @@ This is NOT a bystander event — never reply SKIP for a camera event.
         return sum(confs) / len(confs)
 
     # --------------------------------------------------------------------
-    # Camera worker.
+    # Camera worker — plain V4L2 USB camera, no GStreamer.
     # --------------------------------------------------------------------
     def camera_worker(self) -> None:
         cap = None
         try:
-            pipeline = _build_camera_pipeline()
-            print(f"[Camera] Opening pipeline: {pipeline}")
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            print(f"[Camera] Opening /dev/video{CAMERA_INDEX} via V4L2 ...")
+            cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
             if not cap.isOpened():
-                raise RuntimeError(
-                    "Camera failed to open via GStreamer pipeline. "
-                    "Check OpenCV's GStreamer support."
-                )
+                raise RuntimeError(f"Could not open /dev/video{CAMERA_INDEX}")
+
+            # Request MJPG @ 1280x720 @ 30fps. MJPG is required at this
+            # resolution/framerate; raw YUYV is too much USB bandwidth.
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             ret, test_frame = cap.read()
             if not ret:
                 raise RuntimeError("Camera opened but could not read first frame.")
-            print(f"[Camera] Pipeline up, frame shape: {test_frame.shape}")
+            print(f"[Camera] Open OK, frame shape: {test_frame.shape}")
 
             print("[Camera] Loading YOLOE model on CUDA ...")
             model = YOLOE(self.model_path)
@@ -931,13 +897,10 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                     time.sleep(0.01)
                     continue
 
-                frame = cv2.resize(frame, CAMERA_PROCESS_SIZE)
+                if CAMERA_ROTATION is not None:
+                    frame = cv2.rotate(frame, CAMERA_ROTATION)
 
-                if SATURATION_BOOST != 1.0 or BRIGHTNESS_BOOST != 1.0:
-                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
-                    hsv[..., 1] = np.clip(hsv[..., 1] * SATURATION_BOOST, 0, 255)
-                    hsv[..., 2] = np.clip(hsv[..., 2] * BRIGHTNESS_BOOST, 0, 255)
-                    frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+                frame = cv2.resize(frame, CAMERA_PROCESS_SIZE)
 
                 frame_idx += 1
                 if frame_idx % DETECT_EVERY_N_FRAMES == 0:
@@ -972,7 +935,6 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                 lang_label = f"Lang: {self._get_active_language()}"
                 fps_label = f"FPS: {last_fps:.1f}"
                 font = cv2.FONT_HERSHEY_SIMPLEX
-
                 cv2.putText(display, lang_label, (10, 30), font, 0.8,
                             (255, 255, 255), 2, cv2.LINE_AA)
                 ts = cv2.getTextSize(fps_label, font, 0.8, 2)[0]
@@ -1036,8 +998,18 @@ This is NOT a bystander event — never reply SKIP for a camera event.
         held_long_enough = (current_time - self.object_first_seen_time) >= OBJECT_HOLD_SECONDS
         off_cooldown = (current_time - self.last_object_trigger_time.get(dominant_name, 0.0)) >= OBJECT_COOLDOWN_SECONDS
 
-        if held_long_enough and off_cooldown and not self.is_busy_event.is_set() \
-                and self.request_queue.empty():
+        # Debug print so we know what's blocking trigger if anything.
+        if held_long_enough:
+            busy = self.is_busy_event.is_set()
+            queue_empty = self.request_queue.empty()
+            if not (off_cooldown and not busy and queue_empty):
+                cooldown_remaining = OBJECT_COOLDOWN_SECONDS - (current_time - self.last_object_trigger_time.get(dominant_name, 0.0))
+                print(f"[Trigger BLOCKED] {dominant_name} held "
+                      f"{current_time - self.object_first_seen_time:.1f}s but: "
+                      f"cooldown_remaining={cooldown_remaining:.1f}s, "
+                      f"busy={busy}, queue_empty={queue_empty}")
+                return
+
             print(f"[Camera trigger]: {dominant_name} "
                   f"(conf={dominant['confidence']:.2f}) held {OBJECT_HOLD_SECONDS}s — enqueuing")
             self.last_object_trigger_time[dominant_name] = current_time
@@ -1060,12 +1032,8 @@ This is NOT a bystander event — never reply SKIP for a camera event.
 
         if self._contains_wake_word(text):
             return True
-
-        # Switch commands always pass — they're commands, not chatter.
         if self._detect_switch_command(text):
             return True
-
-        # Exit phrases also always pass.
         if self._is_exit_phrase(text):
             return True
 
@@ -1098,7 +1066,7 @@ This is NOT a bystander event — never reply SKIP for a camera event.
         worker_thread = threading.Thread(target=self._gemini_worker, daemon=True)
         worker_thread.start()
 
-        # Greeting in default language (use pre-rendered WAV for speed).
+        # Greeting in default language (use pre-rendered WAV).
         greeting_wav = self._ack_wavs.get(DEFAULT_LANGUAGE, {}).get("greeting")
         if greeting_wav:
             print(f"🤖 [greeting in {DEFAULT_LANGUAGE}]")
@@ -1126,13 +1094,11 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                 print(f"\n[Heard]: {text}  (lang={self._get_active_language()}, "
                       f"conf={utt.get('conf')}, dur={utt.get('duration', 0):.2f}s)")
 
-                # 1. Switch command — highest priority.
                 target_lang = self._detect_switch_command(text)
                 if target_lang is not None:
                     self._switch_language(target_lang)
                     continue
 
-                # 2. Exit phrases (in active language only).
                 if self._is_exit_phrase(text):
                     exit_wav = self._ack_wavs.get(self._get_active_language(), {}).get("exit_phrase")
                     if exit_wav:

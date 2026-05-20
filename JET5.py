@@ -1,34 +1,24 @@
 """
 ATLAS — Museum Helmet main script for Jetson Orin Nano.
-Multilanguage edition: English / French / Spanish.
+Multilanguage edition: English / French / Spanish / Italian.
 
 Hardware:
-  - Jetson Orin Nano (JetPack 6.1, CUDA 12.6)
-  - Raspberry Pi Camera Module 3 (IMX708) via NVIDIA Argus / GStreamer
-  - USB MillSO mic on sounddevice index 1 (hw:1,0)
+  - Jetson Orin Nano (JetPack 6.x, CUDA 12.6)
+  - USB webcam (HD Camera, MJPG @ 1280x720, /dev/video0)
+  - USB mic on sounddevice index 1 (hw:1,0), stereo, downmixed to mono
   - USB speaker on plughw:0,0 (UACDemoV1.0)
 
-Multilanguage:
-  - Three languages defined in LANGUAGES dict at top.
-  - Active language has its own Vosk model and Piper voice.
-  - Switch via spoken commands. Each language has both NATIVE switch phrases
-    (which work reliably while in that language) AND foreign-language phrases
-    (which may or may not match — depends on Vosk's transcription).
-  - Same for exit phrases: each language has its own.
-  - Phrase matching is accent-insensitive (Vosk often drops accents anyway).
-  - Gemini is told the active language and replies in it.
-  - Ack WAVs are pre-rendered in all 3 languages at startup.
-
-Camera notes (IMX708 quirks):
-  - Only sensor-mode 0 (4608x2592 @ 14fps) has correct ISP tuning.
-  - Driver delivers desaturated colors; we boost saturation in OpenCV.
-  - Brightness adjustable via Argus exposurecompensation OR software HSV V.
-  - GPU downscales 4608x2592 -> 1280x720 in nvvidconv before Python sees it.
+Startup behavior:
+  - Terminal-based language picker. Type 1/2/3/4 to choose.
+  - Acknowledgment WAVs cached in ~/.atlas_ack_cache/
+  - Camera preview only opens if a display is available.
 """
 
 import json
 import os
 import re
+import signal
+import sys
 import time
 import random
 import threading
@@ -40,10 +30,10 @@ from collections import deque
 
 import cv2
 import numpy as np
-import sounddevice as sd
+import sounddevice as sd # type: ignore
 import vosk  # type: ignore
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv # type: ignore
 from google import genai
 from ultralytics import YOLOE  # type: ignore
 
@@ -56,6 +46,7 @@ vosk.SetLogLevel(-1)
 
 # --- Audio input (mic) ---
 MIC_DEVICE = 1
+MIC_CHANNELS = 2
 MIC_NATIVE_RATE = 48000
 MIC_SAMPLE_RATE = 16000
 MIC_BLOCKSIZE = 12000
@@ -67,23 +58,25 @@ AUDIO_OUT_DEVICE: str | None = "plughw:0,0"
 PIPER_DATA_DIR = os.path.expanduser("~/piper_voices")
 PIPER_LENGTH_SCALE = 1.00
 
+# --- Acknowledgment cache (persistent on disk) ---
+ACK_CACHE_DIR = os.path.expanduser("~/.atlas_ack_cache")
+
 # --- Multilanguage definitions ---
 LANGUAGES: dict[str, dict] = {
     "english": {
         "vosk_model": "/opt/vosk_models/vosk-model-small-en-us-0.15",
         "piper_voice": "en_US-ryan-low",
         "switch_phrases": [
-            # English commands (most reliable when in English mode)
-            "switch to english", "speak english", "english please", "in english","switched to english", "1 1", "one one"
-            # French phrases for switching TO English (if French is active)
+            "switch to english", "speak english", "english please", "in english",
             "passez a l anglais", "passe a l anglais", "passe en anglais",
-            "passez en anglais", "parle anglais", "en anglais", " 2 1", "deux un"
-            # Spanish phrases for switching TO English (if Spanish is active)
+            "passez en anglais", "parle anglais", "en anglais",
             "cambia al ingles", "cambiar al ingles", "habla ingles",
-            "en ingles", "ingles por favor", " 3 1", "tres uno"
+            "en ingles", "ingles por favor",
+            "passa all inglese", "passa all'inglese", "parla inglese",
+            "in inglese", "inglese per favore",
         ],
         "exit_phrases": [
-            "goodbye", "good bye", "exit", "quit", "stop program", "see you", " 4 4", "four four"
+            "goodbye", "good bye", "exit", "quit", "stop program", "see you",
         ],
         "ack_first": [
             "Let me think.",
@@ -99,20 +92,20 @@ LANGUAGES: dict[str, dict] = {
             "history, or culture, or just stop in front of an exhibit and I'll tell you about it."
         ),
         "gemini_directive": "Respond ONLY in English.",
+        "display_label": "English",
     },
     "french": {
         "vosk_model": "/opt/vosk_models/vosk-model-small-fr-0.22",
         "piper_voice": "fr_FR-siwis-medium",
         "switch_phrases": [
-            # French commands (most reliable when in French mode)
             "passez au francais", "passe au francais", "passe en francais",
             "passez en francais", "parle francais", "en francais",
             "francais s il vous plait",
-            # English phrases for switching TO French
             "switch to french", "speak french", "french please", "in french",
-            # Spanish phrases for switching TO French
             "cambia al frances", "cambiar al frances", "habla frances",
             "en frances", "frances por favor",
+            "passa al francese", "passa al frances", "parla francese",
+            "in francese", "francese per favore",
         ],
         "exit_phrases": [
             "au revoir", "salut", "a bientot", "termine", "quitte",
@@ -132,20 +125,20 @@ LANGUAGES: dict[str, dict] = {
             "n'importe quelle question sur l'art, l'histoire ou la culture."
         ),
         "gemini_directive": "Respond ONLY in French.",
+        "display_label": "Français",
     },
     "spanish": {
         "vosk_model": "/opt/vosk_models/vosk-model-small-es-0.42",
         "piper_voice": "es_MX-claude-high",
         "switch_phrases": [
-            # Spanish commands (most reliable when in Spanish mode)
             "cambia al espanol", "cambiar al espanol", "habla espanol",
             "en espanol", "espanol por favor",
             "pasa al espanol", "pasar al espanol",
-            # English phrases for switching TO Spanish
             "switch to spanish", "speak spanish", "spanish please", "in spanish",
-            # French phrases for switching TO Spanish
             "passez a l espagnol", "passe a l espagnol", "passe en espagnol",
             "parle espagnol", "en espagnol",
+            "passa allo spagnolo", "parla spagnolo", "in spagnolo",
+            "spagnolo per favore",
         ],
         "exit_phrases": [
             "adios", "hasta luego", "hasta la vista", "salir",
@@ -165,12 +158,50 @@ LANGUAGES: dict[str, dict] = {
             "sobre arte, historia o cultura."
         ),
         "gemini_directive": "Respond ONLY in Spanish.",
+        "display_label": "Español",
+    },
+    "italian": {
+        "vosk_model": "/opt/vosk_models/vosk-model-small-it-0.22",
+        "piper_voice": "it_IT-paola-medium",
+        "switch_phrases": [
+            # Italian commands (most reliable when Italian is active)
+            "passa all italiano", "passa all'italiano", "parla italiano",
+            "in italiano", "italiano per favore", "cambia all italiano",
+            "cambia in italiano",
+            # English phrases for switching TO Italian
+            "switch to italian", "speak italian", "italian please", "in italian",
+            # French phrases for switching TO Italian
+            "passez a l italien", "passe a l italien", "passe en italien",
+            "parle italien", "en italien",
+            # Spanish phrases for switching TO Italian
+            "cambia al italiano", "cambiar al italiano", "habla italiano",
+            "en italiano", "italiano por favor",
+        ],
+        "exit_phrases": [
+            "arrivederci", "ciao", "addio", "esci", "termina",
+            "ferma il programma",
+        ],
+        "ack_first": [
+            "Fammi pensare.",
+            "Un momento, per favore.",
+            "Buona domanda, un attimo.",
+        ],
+        "ack_second": "Scusa, un momento, sto pensando.",
+        "failure": "C'è un problema di connessione in questo momento. Per favore, riprova tra un attimo.",
+        "switch_confirmation": "Passo all'italiano.",
+        "exit_phrase": "Arrivederci.",
+        "greeting": (
+            "Ciao, sono Atlas, la tua guida del museo. Puoi chiedermi qualsiasi cosa "
+            "sull'arte, la storia o la cultura."
+        ),
+        "gemini_directive": "Respond ONLY in Italian.",
+        "display_label": "Italiano",
     },
 }
 
 DEFAULT_LANGUAGE = "english"
 
-# --- Vosk shared ---
+# --- STT shared ---
 STT_MIN_WORDS = 3
 STT_MIN_SECONDS = 1.0
 VOSK_MIN_CONF = 0.55
@@ -183,25 +214,21 @@ WAKE_WORDS = ("atlas", "helmet", "guide", "assistant")
 MEMORY_TURNS = 10
 
 # --- Vision ---
-DETECT_EVERY_N_FRAMES = 1
+DETECT_EVERY_N_FRAMES = 2
 OBJECT_HOLD_SECONDS = 2.0
 OBJECT_COOLDOWN_SECONDS = 8.0
 TRIGGER_OBJECTS = {"mona lisa painting", "vase", "sword", "pharaoh mask"}
 DETECT_CONFIDENCE_THRESHOLD = 0.40
-TRIGGER_CONFIDENCE_THRESHOLD = 0.50
+TRIGGER_CONFIDENCE_THRESHOLD = 0.35
 
-# --- Camera ---
-CAMERA_FLIP = 2
-CAMERA_GST_WIDTH = 4608
-CAMERA_GST_HEIGHT = 2592
-CAMERA_GST_FRAMERATE = 14
-CAMERA_GST_SENSOR_MODE = 0
-CAMERA_PROCESS_SIZE = (1024, 1024)
-YOLOE_IMGSZ = 320
-
-CAMERA_EXPOSURE_COMP = 1.0
-SATURATION_BOOST = 1.6
-BRIGHTNESS_BOOST = 1.0
+# --- USB Camera ---
+CAMERA_INDEX = 0
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 30
+CAMERA_ROTATION = None
+CAMERA_PROCESS_SIZE = (1280, 720)
+YOLOE_IMGSZ = 480
 
 # --- Gemini ---
 GEMINI_MODEL_PRIMARY = "gemini-2.5-flash"
@@ -210,20 +237,65 @@ ACK_DELAY_SECONDS = 1.5
 
 
 # --------------------------------------------------------------------------
+# Display detection & terminal picker.
+# --------------------------------------------------------------------------
+def _has_display() -> bool:
+    if os.environ.get("DISPLAY"):
+        return True
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    return False
+
+
+def show_language_picker() -> str:
+    if not sys.stdin.isatty():
+        print(f"[Picker] Non-interactive shell — defaulting to {DEFAULT_LANGUAGE}.")
+        return DEFAULT_LANGUAGE
+
+    keys = list(LANGUAGES.keys())
+
+    print()
+    print("=" * 50)
+    print("  ATLAS — Choose Language")
+    print("=" * 50)
+    for i, key in enumerate(keys, start=1):
+        label = LANGUAGES[key]["display_label"]
+        print(f"  {i}) {label}")
+    print("=" * 50)
+
+    while True:
+        try:
+            choice = input(f"Enter choice [1-{len(keys)}] (default {DEFAULT_LANGUAGE}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(f"[Picker] No input — defaulting to {DEFAULT_LANGUAGE}.")
+            return DEFAULT_LANGUAGE
+
+        if not choice:
+            return DEFAULT_LANGUAGE
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(keys):
+                return keys[idx]
+
+        lower = choice.lower()
+        if lower in keys:
+            return lower
+
+        print(f"  Invalid choice {choice!r}. Try a number 1-{len(keys)} or a language name.")
+
+
+# --------------------------------------------------------------------------
 # Module-level helpers.
 # --------------------------------------------------------------------------
 def _strip_accents(text: str) -> str:
-    """Normalize text for phrase matching: lowercase + remove accents.
-    Vosk often transcribes 'français' as 'francais', so we normalize both
-    sides when matching switch/exit phrases.
-    """
     text = (text or "").lower().strip()
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
 def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
-    """Run Piper to produce a WAV. `voice` is the model name like 'en_US-ryan-low'."""
     try:
         subprocess.run(
             [
@@ -243,55 +315,43 @@ def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
         return False
 
 
-def _build_camera_pipeline() -> str:
-    """GStreamer pipeline for IMX708 via Argus (sensor-mode 0 only — others broken)."""
-    return (
-        f"nvarguscamerasrc sensor-id=0 sensor-mode={CAMERA_GST_SENSOR_MODE} "
-        f"wbmode=1 aelock=false ee-mode=1 tnr-mode=1 "
-        f"exposurecompensation={CAMERA_EXPOSURE_COMP} ! "
-        f"video/x-raw(memory:NVMM),width={CAMERA_GST_WIDTH},height={CAMERA_GST_HEIGHT},"
-        f"framerate={CAMERA_GST_FRAMERATE}/1 ! "
-        f"nvvidconv flip-method={CAMERA_FLIP} ! "
-        f"video/x-raw,width=1280,height=720,format=BGRx ! "
-        f"videoconvert ! "
-        f"video/x-raw,format=BGR ! "
-        f"appsink drop=true max-buffers=2"
-    )
+def _ensure_ack_wav(voice: str, text: str, cache_path: str) -> bool:
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        return True
+    return _piper_synthesize(voice, text, cache_path)
 
 
 class MuseumHelmet:
-    def __init__(self):
+    def __init__(self, initial_language: str = DEFAULT_LANGUAGE):
         load_dotenv()
 
-        # --- AI setup ---
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not self.gemini_api_key:
             raise RuntimeError("GEMINI_API_KEY not set. Put it in .env.")
         self.client = genai.Client(api_key=self.gemini_api_key)
 
-        # --- Vosk: load ALL language models at startup so switching is fast ---
         self.vosk_models: dict[str, vosk.Model] = {}
         for lang_name, cfg in LANGUAGES.items():
             path = cfg["vosk_model"]
             if not os.path.isdir(path):
-                raise RuntimeError(
-                    f"Vosk model for {lang_name} not found at {path}."
-                )
+                raise RuntimeError(f"Vosk model for {lang_name} not found at {path}.")
             print(f"[STT] Loading Vosk model for {lang_name} from {path} ...")
             self.vosk_models[lang_name] = vosk.Model(path)
         print("[STT] All Vosk models loaded.")
 
-        # --- Active language state ---
-        self.current_language = DEFAULT_LANGUAGE
+        self.current_language = initial_language
         self.language_lock = threading.Lock()
         self.language_change_event = threading.Event()
 
-        # --- YOLOE ---
+        self.has_display = _has_display()
+        if self.has_display:
+            print("[Display] Display detected — preview window will open.")
+        else:
+            print("[Display] No display detected — running headless (no preview window).")
+
         self.model_path = "yoloe-11s-seg.pt"
         self.prompt_names = [
-            # Triggerable artifacts
             "mona lisa painting", "vase", "sword", "pharaoh mask",
-            # Distractors so YOLOE has somewhere to put non-artifact objects
             "person", "face", "hand", "background wall",
         ]
         self.yoloe_imgsz = YOLOE_IMGSZ
@@ -301,7 +361,6 @@ class MuseumHelmet:
         self.last_object_trigger_time = {name: 0.0 for name in self.prompt_names}
         self.last_terminal_objects = None
 
-        # --- Inter-thread state ---
         self.utterance_queue: queue.Queue = queue.Queue()
         self.request_queue: queue.Queue = queue.Queue()
 
@@ -315,17 +374,14 @@ class MuseumHelmet:
         self._piper_proc: subprocess.Popen | None = None
         self._aplay_proc: subprocess.Popen | None = None
 
-        # --- Memory ---
         self.memory: deque = deque(maxlen=MEMORY_TURNS * 2 + 5)
         self.memory_lock = threading.Lock()
 
-        # --- Pre-rendered acknowledgment WAVs per language ---
         self._ack_wavs: dict[str, dict] = {}
-        self._ack_tempdir = tempfile.mkdtemp(prefix="atlas_ack_")
+        os.makedirs(ACK_CACHE_DIR, exist_ok=True)
 
-        # --- System prompt ---
         self.system_prompt = """
-You are Atlas, an AI museum guide embedded in a wearable helmet, speaking directly to a visitor in front of an exhibit. You also have a secondary, non-intrusive safety role.
+You are Atlas, an AI museum guide embedded in a wearable helmet, speaking directly to a visitor in front of an exhibit.
 
 Personality & Style
 Speak warmly, naturally, and conversationally — like a real human guide.
@@ -357,7 +413,6 @@ If something may be misidentified, acknowledge uncertainty and still provide hel
 Vary phrasing to avoid sounding repetitive.
 
 Privacy & Safety
-Keep the safety role subtle and secondary.
 Never mention storing, tracking, or saving personal data.
 """
 
@@ -372,40 +427,44 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
 """
 
     # --------------------------------------------------------------------
-    # Pre-render acknowledgment WAVs for all languages.
+    # Pre-render acknowledgment WAVs for all languages, cached on disk.
     # --------------------------------------------------------------------
     def _prepare_ack_wavs(self) -> None:
-        print("[Piper] Pre-rendering acknowledgment audio for all languages...")
+        print(f"[Piper] Checking acknowledgment cache at {ACK_CACHE_DIR} ...")
+        rendered = 0
+        cached = 0
+
         for lang_name, cfg in LANGUAGES.items():
             voice = cfg["piper_voice"]
             self._ack_wavs[lang_name] = {"first_try": []}
+
             for i, phrase in enumerate(cfg["ack_first"]):
-                path = os.path.join(self._ack_tempdir, f"ack_first_{lang_name}_{i}.wav")
-                if _piper_synthesize(voice, phrase, path):
+                path = os.path.join(ACK_CACHE_DIR, f"ack_first_{lang_name}_{i}.wav")
+                already = os.path.exists(path) and os.path.getsize(path) > 0
+                if _ensure_ack_wav(voice, phrase, path):
                     self._ack_wavs[lang_name]["first_try"].append(path)
+                    if already:
+                        cached += 1
+                    else:
+                        rendered += 1
 
-            path = os.path.join(self._ack_tempdir, f"ack_second_{lang_name}.wav")
-            if _piper_synthesize(voice, cfg["ack_second"], path):
-                self._ack_wavs[lang_name]["second_try"] = path
+            for kind, source_text_key in [
+                ("second_try", "ack_second"),
+                ("failure", "failure"),
+                ("switch_confirmation", "switch_confirmation"),
+                ("greeting", "greeting"),
+                ("exit_phrase", "exit_phrase"),
+            ]:
+                path = os.path.join(ACK_CACHE_DIR, f"{kind}_{lang_name}.wav")
+                already = os.path.exists(path) and os.path.getsize(path) > 0
+                if _ensure_ack_wav(voice, cfg[source_text_key], path):
+                    self._ack_wavs[lang_name][kind] = path
+                    if already:
+                        cached += 1
+                    else:
+                        rendered += 1
 
-            path = os.path.join(self._ack_tempdir, f"failure_{lang_name}.wav")
-            if _piper_synthesize(voice, cfg["failure"], path):
-                self._ack_wavs[lang_name]["failure"] = path
-
-            path = os.path.join(self._ack_tempdir, f"switch_{lang_name}.wav")
-            if _piper_synthesize(voice, cfg["switch_confirmation"], path):
-                self._ack_wavs[lang_name]["switch_confirmation"] = path
-
-            path = os.path.join(self._ack_tempdir, f"greeting_{lang_name}.wav")
-            if _piper_synthesize(voice, cfg["greeting"], path):
-                self._ack_wavs[lang_name]["greeting"] = path
-
-            path = os.path.join(self._ack_tempdir, f"exit_{lang_name}.wav")
-            if _piper_synthesize(voice, cfg["exit_phrase"], path):
-                self._ack_wavs[lang_name]["exit_phrase"] = path
-
-            print(f"[Piper] Acknowledgments ready for {lang_name}.")
-        print("[Piper] All language acknowledgments ready.")
+        print(f"[Piper] Acknowledgments ready. Cached: {cached}, newly rendered: {rendered}.")
 
     def _play_cached_wav(self, wav_path: str) -> None:
         if not wav_path or not os.path.exists(wav_path):
@@ -469,9 +528,10 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
                 return
             print(f"[Lang] switching {self.current_language} -> {new_lang}")
             self.current_language = new_lang
-        # Tell STT loop to reload its recognizer with the new model.
+        with self.memory_lock:
+            self.memory.clear()
+        print("[Lang] conversation memory cleared.")
         self.language_change_event.set()
-        # Speak confirmation in the new language.
         self.is_busy_event.set()
         self.speak_start_time = time.time()
         try:
@@ -483,7 +543,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
             self.last_speak_end_time = time.time()
 
     def _detect_switch_command(self, text: str) -> str | None:
-        """Return the language to switch to if `text` matches a switch phrase, else None."""
         normalized = _strip_accents(text)
         for lang_name, cfg in LANGUAGES.items():
             for phrase in cfg["switch_phrases"]:
@@ -492,7 +551,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
         return None
 
     def _is_exit_phrase(self, text: str) -> bool:
-        """Check if text matches any exit phrase in the ACTIVE language."""
         normalized = _strip_accents(text)
         cfg = LANGUAGES[self._get_active_language()]
         for phrase in cfg.get("exit_phrases", []):
@@ -614,7 +672,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
             except Exception as e:
                 result_holder[key] = ("err", str(e))
 
-        # Phase 1: primary, with first-try ack if slow.
         t1 = threading.Thread(target=attempt, args=(GEMINI_MODEL_PRIMARY, "t1"), daemon=True)
         t1.start()
 
@@ -635,7 +692,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
             return (payload, "ok")
         print(f"[Gemini] primary attempt 1 failed/empty: {payload[:120] if payload else '(empty)'}")
 
-        # Phase 2: retry primary with second ack.
         if ack_enabled:
             second_wav = self._ack_wavs.get(self._get_active_language(), {}).get("second_try")
             if second_wav:
@@ -650,7 +706,6 @@ CRITICAL OUTPUT FORMAT RULES — these are read aloud by a text-to-speech engine
         except Exception as e:
             print(f"[Gemini] primary attempt 2 failed: {e}")
 
-        # Phase 3: silent fallback to lite.
         try:
             print(f"[Gemini] falling back to {GEMINI_MODEL_FALLBACK}")
             text = self._gemini_try_once(GEMINI_MODEL_FALLBACK, prompt)
@@ -790,7 +845,7 @@ This is NOT a bystander event — never reply SKIP for a camera event.
             self._handle_request(req.get("kind"), req.get("text", ""))
 
     # --------------------------------------------------------------------
-    # STT — reloads recognizer when language changes.
+    # STT — reloads recognizer when language changes. Stereo -> mono.
     # --------------------------------------------------------------------
     def _listen_forever(self) -> None:
         audio_q: queue.Queue = queue.Queue()
@@ -805,6 +860,9 @@ This is NOT a bystander event — never reply SKIP for a camera event.
             if (time.time() - self.last_speak_end_time) < POST_SPEAK_SETTLE_SECONDS:
                 return
             samples = np.frombuffer(bytes(indata), dtype=np.int16)
+            if MIC_CHANNELS > 1:
+                samples = samples.reshape(-1, MIC_CHANNELS)
+                samples = samples[:, 0].copy()
             if decim > 1:
                 samples = samples[::decim]
             audio_q.put(samples.tobytes())
@@ -821,12 +879,12 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                     samplerate=MIC_NATIVE_RATE,
                     blocksize=MIC_BLOCKSIZE,
                     dtype="int16",
-                    channels=1,
+                    channels=MIC_CHANNELS,
                     device=MIC_DEVICE,
                     callback=audio_callback,
                 ):
                     print(f"[STT] Listening in {active_lang} on device {MIC_DEVICE} "
-                          f"@ {MIC_NATIVE_RATE} Hz -> {MIC_SAMPLE_RATE} Hz")
+                          f"({MIC_CHANNELS}ch) @ {MIC_NATIVE_RATE} Hz -> {MIC_SAMPLE_RATE} Hz")
 
                     utt_start: float | None = None
                     was_busy = False
@@ -898,19 +956,21 @@ This is NOT a bystander event — never reply SKIP for a camera event.
     def camera_worker(self) -> None:
         cap = None
         try:
-            pipeline = _build_camera_pipeline()
-            print(f"[Camera] Opening pipeline: {pipeline}")
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            print(f"[Camera] Opening /dev/video{CAMERA_INDEX} via V4L2 ...")
+            cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
             if not cap.isOpened():
-                raise RuntimeError(
-                    "Camera failed to open via GStreamer pipeline. "
-                    "Check OpenCV's GStreamer support."
-                )
+                raise RuntimeError(f"Could not open /dev/video{CAMERA_INDEX}")
+
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             ret, test_frame = cap.read()
             if not ret:
                 raise RuntimeError("Camera opened but could not read first frame.")
-            print(f"[Camera] Pipeline up, frame shape: {test_frame.shape}")
+            print(f"[Camera] Open OK, frame shape: {test_frame.shape}")
 
             print("[Camera] Loading YOLOE model on CUDA ...")
             model = YOLOE(self.model_path)
@@ -931,13 +991,10 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                     time.sleep(0.01)
                     continue
 
-                frame = cv2.resize(frame, CAMERA_PROCESS_SIZE)
+                if CAMERA_ROTATION is not None:
+                    frame = cv2.rotate(frame, CAMERA_ROTATION)
 
-                if SATURATION_BOOST != 1.0 or BRIGHTNESS_BOOST != 1.0:
-                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
-                    hsv[..., 1] = np.clip(hsv[..., 1] * SATURATION_BOOST, 0, 255)
-                    hsv[..., 2] = np.clip(hsv[..., 2] * BRIGHTNESS_BOOST, 0, 255)
-                    frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+                frame = cv2.resize(frame, CAMERA_PROCESS_SIZE)
 
                 frame_idx += 1
                 if frame_idx % DETECT_EVERY_N_FRAMES == 0:
@@ -967,25 +1024,25 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                     last_fps = 1000.0 / inference_time if inference_time > 0 else 0.0
                     self._maybe_trigger_object_explanation(detections)
 
-                display = last_annotated if last_annotated is not None else frame
+                if self.has_display:
+                    display = last_annotated if last_annotated is not None else frame
+                    lang_label = f"Lang: {self._get_active_language()}"
+                    fps_label = f"FPS: {last_fps:.1f}"
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    cv2.putText(display, lang_label, (10, 30), font, 0.8,
+                                (255, 255, 255), 2, cv2.LINE_AA)
+                    ts = cv2.getTextSize(fps_label, font, 0.8, 2)[0]
+                    cv2.putText(display, fps_label, (display.shape[1] - ts[0] - 10, 30),
+                                font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                    try:
+                        cv2.imshow("ATLAS Museum Helmet", display)
+                        if cv2.waitKey(1) == ord("q"):
+                            self.stop_event.set()
+                            break
+                    except cv2.error:
+                        print("[Display] cv2.imshow failed mid-run, disabling preview.")
+                        self.has_display = False
 
-                lang_label = f"Lang: {self._get_active_language()}"
-                fps_label = f"FPS: {last_fps:.1f}"
-                font = cv2.FONT_HERSHEY_SIMPLEX
-
-                cv2.putText(display, lang_label, (10, 30), font, 0.8,
-                            (255, 255, 255), 2, cv2.LINE_AA)
-                ts = cv2.getTextSize(fps_label, font, 0.8, 2)[0]
-                cv2.putText(display, fps_label, (display.shape[1] - ts[0] - 10, 30),
-                            font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-
-                try:
-                    cv2.imshow("ATLAS Museum Helmet", display)
-                    if cv2.waitKey(1) == ord("q"):
-                        self.stop_event.set()
-                        break
-                except cv2.error:
-                    cv2.imwrite("/tmp/atlas_latest_frame.jpg", display)
         except Exception as e:
             print("Camera worker error:", e)
         finally:
@@ -995,7 +1052,8 @@ This is NOT a bystander event — never reply SKIP for a camera event.
             except Exception:
                 pass
             try:
-                cv2.destroyAllWindows()
+                if self.has_display:
+                    cv2.destroyAllWindows()
             except Exception:
                 pass
 
@@ -1016,9 +1074,18 @@ This is NOT a bystander event — never reply SKIP for a camera event.
             if d["name"] in TRIGGER_OBJECTS
             and d["confidence"] >= TRIGGER_CONFIDENCE_THRESHOLD
         ]
-        if not triggerable:
+        still_seeing = [
+            d for d in detections
+            if d["name"] in TRIGGER_OBJECTS
+            and d["confidence"] >= DETECT_CONFIDENCE_THRESHOLD
+        ]
+
+        if not still_seeing:
             self.last_seen_object = None
             self.object_first_seen_time = None
+            return
+
+        if not triggerable:
             return
 
         dominant = max(triggerable, key=lambda d: d["confidence"])
@@ -1036,8 +1103,17 @@ This is NOT a bystander event — never reply SKIP for a camera event.
         held_long_enough = (current_time - self.object_first_seen_time) >= OBJECT_HOLD_SECONDS
         off_cooldown = (current_time - self.last_object_trigger_time.get(dominant_name, 0.0)) >= OBJECT_COOLDOWN_SECONDS
 
-        if held_long_enough and off_cooldown and not self.is_busy_event.is_set() \
-                and self.request_queue.empty():
+        if held_long_enough:
+            busy = self.is_busy_event.is_set()
+            queue_empty = self.request_queue.empty()
+            if not (off_cooldown and not busy and queue_empty):
+                cooldown_remaining = OBJECT_COOLDOWN_SECONDS - (current_time - self.last_object_trigger_time.get(dominant_name, 0.0))
+                print(f"[Trigger BLOCKED] {dominant_name} held "
+                      f"{current_time - self.object_first_seen_time:.1f}s but: "
+                      f"cooldown_remaining={cooldown_remaining:.1f}s, "
+                      f"busy={busy}, queue_empty={queue_empty}")
+                return
+
             print(f"[Camera trigger]: {dominant_name} "
                   f"(conf={dominant['confidence']:.2f}) held {OBJECT_HOLD_SECONDS}s — enqueuing")
             self.last_object_trigger_time[dominant_name] = current_time
@@ -1060,12 +1136,8 @@ This is NOT a bystander event — never reply SKIP for a camera event.
 
         if self._contains_wake_word(text):
             return True
-
-        # Switch commands always pass — they're commands, not chatter.
         if self._detect_switch_command(text):
             return True
-
-        # Exit phrases also always pass.
         if self._is_exit_phrase(text):
             return True
 
@@ -1098,10 +1170,9 @@ This is NOT a bystander event — never reply SKIP for a camera event.
         worker_thread = threading.Thread(target=self._gemini_worker, daemon=True)
         worker_thread.start()
 
-        # Greeting in default language (use pre-rendered WAV for speed).
-        greeting_wav = self._ack_wavs.get(DEFAULT_LANGUAGE, {}).get("greeting")
+        greeting_wav = self._ack_wavs.get(self._get_active_language(), {}).get("greeting")
         if greeting_wav:
-            print(f"🤖 [greeting in {DEFAULT_LANGUAGE}]")
+            print(f"🤖 [greeting in {self._get_active_language()}]")
             self.is_busy_event.set()
             self.speak_start_time = time.time()
             try:
@@ -1110,7 +1181,7 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                 self.is_busy_event.clear()
                 self.last_speak_end_time = time.time()
         else:
-            self.say_blocking(LANGUAGES[DEFAULT_LANGUAGE]["greeting"])
+            self.say_blocking(LANGUAGES[self._get_active_language()]["greeting"])
 
         try:
             while not self.stop_event.is_set():
@@ -1126,13 +1197,11 @@ This is NOT a bystander event — never reply SKIP for a camera event.
                 print(f"\n[Heard]: {text}  (lang={self._get_active_language()}, "
                       f"conf={utt.get('conf')}, dur={utt.get('duration', 0):.2f}s)")
 
-                # 1. Switch command — highest priority.
                 target_lang = self._detect_switch_command(text)
                 if target_lang is not None:
                     self._switch_language(target_lang)
                     continue
 
-                # 2. Exit phrases (in active language only).
                 if self._is_exit_phrase(text):
                     exit_wav = self._ack_wavs.get(self._get_active_language(), {}).get("exit_phrase")
                     if exit_wav:
@@ -1164,5 +1233,21 @@ This is NOT a bystander event — never reply SKIP for a camera event.
 
 
 if __name__ == "__main__":
-    helmet = MuseumHelmet()
+    chosen_lang = show_language_picker()
+    print(f"[Init] Starting in language: {chosen_lang}")
+
+    helmet = MuseumHelmet(initial_language=chosen_lang)
+
+    # Aggressive shutdown handler — fixes the Ctrl+C hang issue.
+    def _emergency_shutdown(signum, frame):
+        print("\n[Shutdown] Forcing immediate exit...")
+        helmet.stop_event.set()
+        helmet._hard_stop_all_audio()
+        os.system("pkill -9 -f piper 2>/dev/null")
+        os.system("pkill -9 aplay 2>/dev/null")
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _emergency_shutdown)
+    signal.signal(signal.SIGTERM, _emergency_shutdown)
+
     helmet.start()

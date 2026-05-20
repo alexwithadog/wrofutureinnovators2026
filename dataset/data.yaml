@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 6
+names: ['libre', 'monalisa', 'objects', 'skrik', 'starrynight', 'sunflower']
+
+roboflow:
+  workspace: testing-images
+  project: paintings-mk265
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/testing-images/paintings-mk265/dataset/1
