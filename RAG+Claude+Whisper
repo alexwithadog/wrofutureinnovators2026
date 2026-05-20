@@ -1,0 +1,1387 @@
+"""
+ATLAS - Museum Helmet (Jetson + Claude + Whisper + RAG)
+========================================================
+Full integrated system using the sprint-compliant stack:
+Jetson Orin Nano + faster-whisper (STT) + silero VAD +
+Claude API (LLM) + ChromaDB-backed RAG + YOLOE (vision) + Piper (TTS).
+
+Hardware:
+  - Jetson Orin Nano (JetPack 6.1, CUDA 12.6)
+  - Raspberry Pi Camera Module 3 (IMX708) via NVIDIA Argus / GStreamer
+  - USB MillSO mic on sounddevice index 1 (hw:1,0)
+  - USB speaker on plughw:0,0 (UACDemoV1.0)
+
+Prerequisites:
+  pip install chromadb sentence-transformers anthropic \\
+              faster-whisper torch torchaudio \\
+              sounddevice opencv-python numpy python-dotenv \\
+              ultralytics
+  The atlas/ package and data/artworks/ must exist
+  (created by the day-2 RAG bootstrap).
+  Set ANTHROPIC_API_KEY in .env.
+
+How this differs from the Vosk variant:
+  - Whisper is NOT streaming. We need a Voice Activity Detector (VAD)
+    to know when the visitor stops speaking, then transcribe the
+    accumulated audio buffer in one batch.
+  - silero VAD runs on every 100 ms audio chunk and reports a speech
+    probability. When probability stays above threshold, we start
+    buffering audio. When it stays below threshold for ~700 ms, we
+    consider the utterance complete and send it to Whisper.
+  - One Whisper model handles all three languages. We pass the active
+    language as a hint via the ISO code (en/fr/es).
+  - No need to reload anything on language switch - just update the
+    language hint passed to Whisper next time.
+
+Whisper model sizing on Orin Nano:
+  - "tiny"   : ~75 MB, fastest but accuracy drops on accents
+  - "base"   : ~150 MB, recommended default (good speed/accuracy)
+  - "small"  : ~500 MB, more accurate but adds ~300-500 ms latency
+  - "medium" : 1.5 GB, overkill for short museum questions
+  Run with WHISPER_MODEL_SIZE="base" + compute_type="float16" by default.
+"""
+
+import os
+import re
+import sys
+import time
+import random
+import threading
+import queue
+import subprocess
+import tempfile
+import unicodedata
+from collections import deque
+
+import cv2
+import numpy as np
+import sounddevice as sd
+import torch
+
+from dotenv import load_dotenv
+import anthropic
+from ultralytics import YOLOE  # type: ignore
+from faster_whisper import WhisperModel
+
+# Make the atlas/ package importable when running this file directly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from atlas.rag import RAG
+
+
+# --------------------------------------------------------------------------
+# Tunable constants.
+# --------------------------------------------------------------------------
+
+# --- Audio input (mic) ---
+# Whisper natively expects 16 kHz mono. We capture directly at 16 kHz
+# instead of capturing at 48 kHz and decimating like the Vosk variant.
+MIC_DEVICE = 1
+MIC_SAMPLE_RATE = 16000
+# 100 ms chunks at 16 kHz = 1600 samples. silero VAD operates well at this size.
+MIC_BLOCKSIZE = 1600
+
+# --- Audio output (speaker) ---
+AUDIO_OUT_DEVICE: str | None = "plughw:0,0"
+
+# --- Piper global ---
+PIPER_DATA_DIR = os.path.expanduser("~/piper_voices")
+PIPER_LENGTH_SCALE = 1.00
+
+# --- Multilanguage definitions ---
+# Note: the "vosk_model" field is removed (Whisper doesn't need per-language
+# models). We keep the same structure for ack WAVs, voices, switch phrases.
+LANGUAGES: dict[str, dict] = {
+    "english": {
+        "iso": "en",  # Whisper language code
+        "piper_voice": "en_US-ryan-low",
+        "switch_phrases": [
+            "switch to english", "speak english", "english please", "in english",
+            "passez a l anglais", "passe a l anglais", "passe en anglais",
+            "passez en anglais", "parle anglais", "en anglais",
+            "cambia al ingles", "cambiar al ingles", "habla ingles",
+            "en ingles", "ingles por favor",
+        ],
+        "exit_phrases": [
+            "goodbye", "good bye", "exit", "quit", "stop program", "see you",
+        ],
+        "ack_first": [
+            "Let me think.",
+            "One moment please.",
+            "Good question, give me a second.",
+        ],
+        "ack_second": "Sorry, one second, let me think.",
+        "failure": "There's a problem with the connection right now. Please try again in a moment.",
+        "switch_confirmation": "Switching to English.",
+        "exit_phrase": "Goodbye.",
+        "greeting": (
+            "Hi, I'm Atlas, your museum guide. You can ask me anything about art, "
+            "history, or culture, or just stop in front of an exhibit and I'll tell you about it."
+        ),
+        "llm_directive": "Respond ONLY in English.",
+    },
+    "french": {
+        "iso": "fr",
+        "piper_voice": "fr_FR-siwis-medium",
+        "switch_phrases": [
+            "passez au francais", "passe au francais", "passe en francais",
+            "passez en francais", "parle francais", "en francais",
+            "francais s il vous plait",
+            "switch to french", "speak french", "french please", "in french",
+            "cambia al frances", "cambiar al frances", "habla frances",
+            "en frances", "frances por favor",
+        ],
+        "exit_phrases": [
+            "au revoir", "salut", "a bientot", "termine", "quitte",
+            "arrete le programme",
+        ],
+        "ack_first": [
+            "Laisse-moi reflechir.",
+            "Un instant, s'il vous plait.",
+            "Bonne question, un moment.",
+        ],
+        "ack_second": "Desole, un moment, je reflechis.",
+        "failure": "Il y a un probleme de connexion en ce moment. Veuillez reessayer dans un instant.",
+        "switch_confirmation": "Je passe au francais.",
+        "exit_phrase": "Au revoir.",
+        "greeting": (
+            "Bonjour, je suis Atlas, votre guide de musee. Vous pouvez me poser "
+            "n'importe quelle question sur l'art, l'histoire ou la culture."
+        ),
+        "llm_directive": "Respond ONLY in French.",
+    },
+    "spanish": {
+        "iso": "es",
+        "piper_voice": "es_MX-claude-high",
+        "switch_phrases": [
+            "cambia al espanol", "cambiar al espanol", "habla espanol",
+            "en espanol", "espanol por favor",
+            "pasa al espanol", "pasar al espanol",
+            "switch to spanish", "speak spanish", "spanish please", "in spanish",
+            "passez a l espagnol", "passe a l espagnol", "passe en espagnol",
+            "parle espagnol", "en espagnol",
+        ],
+        "exit_phrases": [
+            "adios", "hasta luego", "hasta la vista", "salir",
+            "termina el programa",
+        ],
+        "ack_first": [
+            "Dejame pensar.",
+            "Un momento, por favor.",
+            "Buena pregunta, un momento.",
+        ],
+        "ack_second": "Disculpe, un momento, estoy pensando.",
+        "failure": "Hay un problema de conexion ahora mismo. Por favor, intentelo de nuevo en un momento.",
+        "switch_confirmation": "Cambiando al espanol.",
+        "exit_phrase": "Adios.",
+        "greeting": (
+            "Hola, soy Atlas, su guia del museo. Puede preguntarme cualquier cosa "
+            "sobre arte, historia o cultura."
+        ),
+        "llm_directive": "Respond ONLY in Spanish.",
+    },
+}
+
+DEFAULT_LANGUAGE = "english"
+
+# --- Whisper ---
+WHISPER_MODEL_SIZE = "base"
+WHISPER_DEVICE = "cuda"
+WHISPER_COMPUTE_TYPE = "float16"
+
+# --- VAD (silero) ---
+# Speech probability threshold. Above this, the chunk is "speech".
+VAD_THRESHOLD = 0.5
+# A pause longer than this ends the current utterance.
+VAD_MIN_SILENCE_MS = 700
+# Utterances shorter than this are dropped as noise.
+VAD_MIN_SPEECH_MS = 250
+# When speech starts, prepend this much pre-buffered audio so the first
+# word isn't clipped.
+VAD_PRE_BUFFER_MS = 300
+
+# --- STT shared ---
+STT_MIN_WORDS = 3
+STT_MIN_SECONDS = 1.0
+# Whisper confidence is computed from avg_logprob (see _logprob_to_score).
+WHISPER_MIN_CONF = 0.55
+POST_SPEAK_SETTLE_SECONDS = 0.60
+
+# --- Wake words ---
+WAKE_WORDS = ("atlas", "helmet", "guide", "assistant")
+
+# --- Memory ---
+MEMORY_TURNS = 10
+
+# --- Vision ---
+DETECT_EVERY_N_FRAMES = 1
+OBJECT_HOLD_SECONDS = 2.0
+OBJECT_COOLDOWN_SECONDS = 8.0
+TRIGGER_OBJECTS = {"mona lisa painting", "vase", "sword", "pharaoh mask"}
+DETECT_CONFIDENCE_THRESHOLD = 0.40
+TRIGGER_CONFIDENCE_THRESHOLD = 0.50
+
+# --- Camera ---
+CAMERA_FLIP = 2
+CAMERA_GST_WIDTH = 4608
+CAMERA_GST_HEIGHT = 2592
+CAMERA_GST_FRAMERATE = 14
+CAMERA_GST_SENSOR_MODE = 0
+CAMERA_PROCESS_SIZE = (1024, 1024)
+YOLOE_IMGSZ = 320
+
+CAMERA_EXPOSURE_COMP = 1.0
+SATURATION_BOOST = 1.6
+BRIGHTNESS_BOOST = 1.0
+
+# --- Claude ---
+CLAUDE_MODEL_PRIMARY = "claude-haiku-4-5-20251001"
+CLAUDE_MODEL_FALLBACK = "claude-haiku-4-5-20251001"
+CLAUDE_MAX_TOKENS = 300
+ACK_DELAY_SECONDS = 1.5
+
+# --- RAG ---
+RAG_SCORE_THRESHOLD = 0.50
+RAG_TOP_K = 1
+
+# YOLOE class name -> RAG artwork ID. Direct lookup avoids fuzzy search
+# when we already know exactly what the camera saw.
+YOLOE_TO_ARTWORK_ID = {
+    "mona lisa painting": "artwork_001_mona_lisa",
+    "pharaoh mask": "artwork_003_tutankhamun_mask",
+    # vase / sword have no sheet yet - Claude falls back to general knowledge
+}
+
+
+# --------------------------------------------------------------------------
+# Module-level helpers.
+# --------------------------------------------------------------------------
+def _strip_accents(text: str) -> str:
+    """Normalize text for phrase matching: lowercase + accent stripped.
+    Whisper preserves accents, but we strip them for switch/exit detection
+    so 'francais' and 'francais' both match."""
+    text = (text or "").lower().strip()
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
+    """Run Piper to produce a WAV. `voice` is a model name like
+    'en_US-ryan-low'. Returns True only on a non-empty output file."""
+    try:
+        subprocess.run(
+            [
+                "python3", "-m", "piper",
+                "--model", voice,
+                "--data-dir", PIPER_DATA_DIR,
+                "--length-scale", str(PIPER_LENGTH_SCALE),
+                "--output-file", out_path,
+            ],
+            input=text.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _build_camera_pipeline() -> str:
+    """GStreamer pipeline for the IMX708 camera through Argus.
+    Sensor mode 0 is the only mode with correct ISP tuning."""
+    return (
+        f"nvarguscamerasrc sensor-id=0 sensor-mode={CAMERA_GST_SENSOR_MODE} "
+        f"wbmode=1 aelock=false ee-mode=1 tnr-mode=1 "
+        f"exposurecompensation={CAMERA_EXPOSURE_COMP} ! "
+        f"video/x-raw(memory:NVMM),width={CAMERA_GST_WIDTH},height={CAMERA_GST_HEIGHT},"
+        f"framerate={CAMERA_GST_FRAMERATE}/1 ! "
+        f"nvvidconv flip-method={CAMERA_FLIP} ! "
+        f"video/x-raw,width=1280,height=720,format=BGRx ! "
+        f"videoconvert ! "
+        f"video/x-raw,format=BGR ! "
+        f"appsink drop=true max-buffers=2"
+    )
+
+
+def _format_sheet_for_prompt(sheet: dict) -> str:
+    """Format a RAG sheet (dict) into a readable text block for the LLM."""
+    return (
+        f"Title: {sheet.get('title', '')}\n"
+        f"Artist: {sheet.get('artist', '')}\n"
+        f"Year: {sheet.get('year', '')}\n"
+        f"Description: {sheet.get('long_description', '')}\n"
+        f"Historical context: {sheet.get('historical_context', '')}\n"
+        f"Themes: {', '.join(sheet.get('themes', []))}\n"
+        f"Anecdote: {sheet.get('anecdote', '')}\n"
+    )
+
+
+def _logprob_to_score(avg_logprob: float | None) -> float:
+    """Convert Whisper's avg_logprob (typically -1.0 to 0.0) into a 0..1
+    confidence score. exp(logprob) gives a real probability."""
+    if avg_logprob is None:
+        return 0.5
+    return max(0.0, min(1.0, float(np.exp(avg_logprob))))
+
+
+class MuseumHelmet:
+    def __init__(self):
+        load_dotenv()
+
+        # --- Claude client ---
+        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not self.anthropic_api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY not set. Put it in .env.")
+        self.client = anthropic.Anthropic(api_key=self.anthropic_api_key)
+
+        # --- RAG (loads ChromaDB and embedding model once) ---
+        print("[RAG] Initializing RAG (downloads embedding model on first run)...")
+        self.rag = RAG()
+        print(f"[RAG] Collection size: {self.rag.collection.count()} sheet(s)")
+
+        # --- Whisper (one model for all languages) ---
+        print(f"[STT] Loading faster-whisper {WHISPER_MODEL_SIZE} on "
+              f"{WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})...")
+        self.whisper = WhisperModel(
+            WHISPER_MODEL_SIZE,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE,
+        )
+        print("[STT] Whisper loaded.")
+
+        # --- silero VAD (lightweight, ~2 MB, downloaded on first hub.load) ---
+        print("[VAD] Loading silero VAD...")
+        self.vad_model, _ = torch.hub.load(
+            "snakers4/silero-vad",
+            "silero_vad",
+            trust_repo=True,
+        )
+        # silero VAD is small enough to run on CPU; keep it off CUDA
+        # to avoid contending with YOLOE and Whisper for GPU memory.
+        self.vad_model.eval()
+        print("[VAD] silero VAD loaded.")
+
+        # --- Active language state ---
+        self.current_language = DEFAULT_LANGUAGE
+        self.language_lock = threading.Lock()
+        # Note: no language_change_event needed - Whisper uses one model
+        # and we just change the language hint passed to it.
+
+        # --- YOLOE ---
+        self.model_path = "yoloe-11s-seg.pt"
+        self.prompt_names = [
+            "mona lisa painting", "vase", "sword", "pharaoh mask",
+            "person", "face", "hand", "background wall",
+        ]
+        self.yoloe_imgsz = YOLOE_IMGSZ
+
+        self.last_seen_object = None
+        self.object_first_seen_time = None
+        self.last_object_trigger_time = {name: 0.0 for name in self.prompt_names}
+        self.last_terminal_objects = None
+
+        # --- Inter-thread state ---
+        self.utterance_queue: queue.Queue = queue.Queue()
+        self.request_queue: queue.Queue = queue.Queue()
+
+        self.stop_event = threading.Event()
+        self.is_busy_event = threading.Event()
+
+        self.speak_start_time = 0.0
+        self.last_speak_end_time = 0.0
+
+        self._proc_lock = threading.Lock()
+        self._piper_proc: subprocess.Popen | None = None
+        self._aplay_proc: subprocess.Popen | None = None
+
+        # --- Memory ---
+        self.memory: deque = deque(maxlen=MEMORY_TURNS * 2 + 5)
+        self.memory_lock = threading.Lock()
+
+        # --- Pre-rendered acknowledgment WAVs per language ---
+        self._ack_wavs: dict[str, dict] = {}
+        self._ack_tempdir = tempfile.mkdtemp(prefix="atlas_ack_")
+
+        # --- System prompt (mentions the [Museum sheet] block from RAG) ---
+        self.system_prompt = """
+You are Atlas, an AI museum guide embedded in a wearable helmet, speaking directly to a visitor in front of an exhibit. You also have a secondary, non-intrusive safety role.
+
+Personality & Style
+Speak warmly, naturally, and conversationally - like a real human guide.
+Avoid sounding robotic, scripted, or like a textbook.
+Keep responses concise: usually 1-2 short sentences, 3 only if clarity really needs it.
+Prefer short back-and-forth interaction over long explanations.
+Adjust energy depending on the subject.
+
+What you will answer
+You are an educational and cultural guide first. ANSWER any reasonable question about
+art, history, culture, artifacts, artworks, artists, architecture, literature, mythology,
+religion, science, nature, geography, historical events, historical figures, museums, and
+general knowledge an educated museum guide would know - whether or not the subject is
+physically in front of the visitor.
+
+Only gently redirect for things clearly unrelated to education or culture: personal advice,
+medical advice, financial advice, live sports scores, current news, directions to specific
+addresses, or explicit political debate.
+
+Knowledge source
+When a [Museum sheet] block is included in the prompt, treat it as the ground truth
+for that specific artwork. Prefer its facts over your general knowledge. Do not quote it
+verbatim - paraphrase it into natural spoken language.
+
+When no [Museum sheet] is present, answer from your general knowledge as best you can.
+
+Style rules when answering
+Give clear, simple, meaningful explanations.
+When explaining an object: say what it is, why it matters, and one interesting detail.
+Adapt to the visitor's level: simplify for beginners, add depth for advanced questions.
+If unsure, acknowledge uncertainty calmly while still giving helpful context.
+
+Vision & Context Awareness
+Treat [Camera] notes as context about what the visitor is looking at right now.
+If something may be misidentified, acknowledge uncertainty and still provide helpful context.
+Vary phrasing to avoid sounding repetitive.
+
+Privacy & Safety
+Keep the safety role subtle and secondary.
+Never mention storing, tracking, or saving personal data.
+"""
+
+        self.formatting_rules = """
+CRITICAL OUTPUT FORMAT RULES - these are read aloud by a text-to-speech engine:
+- Do NOT use asterisks (*), underscores (_), backticks (`), or any markdown.
+- Do NOT use bold, italics, or any emphasis markers.
+- Do NOT use bullet points, numbered lists, or dashes for lists.
+- Do NOT use headers, titles, or section labels.
+- Do NOT use emoji.
+- Write ONLY plain spoken prose - continuous sentences, like a person talking.
+"""
+
+    # --------------------------------------------------------------------
+    # Pre-render acknowledgment WAVs for all languages.
+    # --------------------------------------------------------------------
+    def _prepare_ack_wavs(self) -> None:
+        print("[Piper] Pre-rendering acknowledgment audio for all languages...")
+        for lang_name, cfg in LANGUAGES.items():
+            voice = cfg["piper_voice"]
+            self._ack_wavs[lang_name] = {"first_try": []}
+
+            for i, phrase in enumerate(cfg["ack_first"]):
+                path = os.path.join(self._ack_tempdir, f"ack_first_{lang_name}_{i}.wav")
+                if _piper_synthesize(voice, phrase, path):
+                    self._ack_wavs[lang_name]["first_try"].append(path)
+
+            path = os.path.join(self._ack_tempdir, f"ack_second_{lang_name}.wav")
+            if _piper_synthesize(voice, cfg["ack_second"], path):
+                self._ack_wavs[lang_name]["second_try"] = path
+
+            path = os.path.join(self._ack_tempdir, f"failure_{lang_name}.wav")
+            if _piper_synthesize(voice, cfg["failure"], path):
+                self._ack_wavs[lang_name]["failure"] = path
+
+            path = os.path.join(self._ack_tempdir, f"switch_{lang_name}.wav")
+            if _piper_synthesize(voice, cfg["switch_confirmation"], path):
+                self._ack_wavs[lang_name]["switch_confirmation"] = path
+
+            path = os.path.join(self._ack_tempdir, f"greeting_{lang_name}.wav")
+            if _piper_synthesize(voice, cfg["greeting"], path):
+                self._ack_wavs[lang_name]["greeting"] = path
+
+            path = os.path.join(self._ack_tempdir, f"exit_{lang_name}.wav")
+            if _piper_synthesize(voice, cfg["exit_phrase"], path):
+                self._ack_wavs[lang_name]["exit_phrase"] = path
+
+            print(f"[Piper] Acknowledgments ready for {lang_name}.")
+        print("[Piper] All language acknowledgments ready.")
+
+    def _play_cached_wav(self, wav_path: str) -> None:
+        """Play a pre-rendered WAV through aplay. Blocking."""
+        if not wav_path or not os.path.exists(wav_path):
+            return
+        aplay_cmd = ["aplay", "-q"]
+        if AUDIO_OUT_DEVICE:
+            aplay_cmd += ["-D", AUDIO_OUT_DEVICE]
+        aplay_cmd.append(wav_path)
+        try:
+            with self._proc_lock:
+                self._aplay_proc = subprocess.Popen(
+                    aplay_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self._aplay_proc.wait()
+        finally:
+            with self._proc_lock:
+                self._aplay_proc = None
+
+    # --------------------------------------------------------------------
+    # Memory.
+    # --------------------------------------------------------------------
+    def _memory_append(self, role: str, text: str) -> None:
+        with self.memory_lock:
+            self.memory.append((role, text))
+
+    def _memory_as_transcript(self) -> str:
+        with self.memory_lock:
+            items = list(self.memory)
+        lines = []
+        for role, text in items:
+            if role == "user":
+                lines.append(f"Visitor: {text}")
+            elif role == "assistant":
+                lines.append(f"Guide: {text}")
+            elif role == "camera":
+                lines.append(f"[Camera] Visitor is now looking at: {text}")
+        return "\n".join(lines) if lines else "(no prior turns)"
+
+    # --------------------------------------------------------------------
+    # Active language helpers.
+    # --------------------------------------------------------------------
+    def _get_active_language(self) -> str:
+        with self.language_lock:
+            return self.current_language
+
+    def _get_active_voice(self) -> str:
+        return LANGUAGES[self._get_active_language()]["piper_voice"]
+
+    def _get_active_iso(self) -> str:
+        """Return the ISO code (en/fr/es) for Whisper's language hint."""
+        return LANGUAGES[self._get_active_language()]["iso"]
+
+    def _get_active_llm_directive(self) -> str:
+        return LANGUAGES[self._get_active_language()]["llm_directive"]
+
+    def _switch_language(self, new_lang: str) -> None:
+        """Switch language. Whisper handles all languages with one model,
+        so we don't reload anything - just update the active language
+        and the next transcription will use the new ISO hint."""
+        if new_lang not in LANGUAGES:
+            print(f"[Lang] unknown language: {new_lang}")
+            return
+        with self.language_lock:
+            if new_lang == self.current_language:
+                print(f"[Lang] already in {new_lang}")
+                return
+            print(f"[Lang] switching {self.current_language} -> {new_lang}")
+            self.current_language = new_lang
+
+        # Speak confirmation in the new language.
+        self.is_busy_event.set()
+        self.speak_start_time = time.time()
+        try:
+            wav = self._ack_wavs.get(new_lang, {}).get("switch_confirmation")
+            if wav:
+                self._play_cached_wav(wav)
+        finally:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+
+    def _detect_switch_command(self, text: str) -> str | None:
+        normalized = _strip_accents(text)
+        for lang_name, cfg in LANGUAGES.items():
+            for phrase in cfg["switch_phrases"]:
+                if _strip_accents(phrase) in normalized:
+                    return lang_name
+        return None
+
+    def _is_exit_phrase(self, text: str) -> bool:
+        normalized = _strip_accents(text)
+        cfg = LANGUAGES[self._get_active_language()]
+        for phrase in cfg.get("exit_phrases", []):
+            if _strip_accents(phrase) in normalized:
+                return True
+        return False
+
+    # --------------------------------------------------------------------
+    # TTS.
+    # --------------------------------------------------------------------
+    def _sanitize_for_tts(self, text: str) -> str:
+        if not text:
+            return text
+        text = re.sub(r"[*_`~]", "", text)
+        text = re.sub(r"^\s*[-•]+\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^\s*\d+[.)]\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _speak_full(self, text: str) -> None:
+        text = self._sanitize_for_tts(text)
+        if not text:
+            return
+
+        voice = self._get_active_voice()
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+            wav_path = tmp_wav.name
+
+        try:
+            piper_cmd = [
+                "python3", "-m", "piper",
+                "--model", voice,
+                "--data-dir", PIPER_DATA_DIR,
+                "--length-scale", str(PIPER_LENGTH_SCALE),
+                "--output-file", wav_path,
+            ]
+            with self._proc_lock:
+                self._piper_proc = subprocess.Popen(
+                    piper_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            try:
+                if self._piper_proc.stdin:
+                    self._piper_proc.stdin.write(text.encode("utf-8"))
+                    self._piper_proc.stdin.close()
+            except Exception:
+                pass
+            self._piper_proc.wait()
+            with self._proc_lock:
+                self._piper_proc = None
+
+            if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+                return
+
+            aplay_cmd = ["aplay", "-q"]
+            if AUDIO_OUT_DEVICE:
+                aplay_cmd += ["-D", AUDIO_OUT_DEVICE]
+            aplay_cmd.append(wav_path)
+
+            with self._proc_lock:
+                self._aplay_proc = subprocess.Popen(
+                    aplay_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self._aplay_proc.wait()
+            with self._proc_lock:
+                self._aplay_proc = None
+        finally:
+            if os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
+
+    def _hard_stop_all_audio(self) -> None:
+        with self._proc_lock:
+            for p in (self._piper_proc, self._aplay_proc):
+                if p and p.poll() is None:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+
+    def say_blocking(self, text: str) -> None:
+        print(f"[TTS] {text}")
+        self.is_busy_event.set()
+        self.speak_start_time = time.time()
+        try:
+            self._speak_full(text)
+        finally:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+
+    # --------------------------------------------------------------------
+    # Claude.
+    # --------------------------------------------------------------------
+    def _claude_try_once(self, model: str, prompt: str) -> str:
+        chunks: list[str] = []
+        with self.client.messages.stream(
+            model=model,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            for text in stream.text_stream:
+                if text:
+                    chunks.append(text)
+        return "".join(chunks).strip()
+
+    def _claude_request_with_retries(self, prompt: str,
+                                     ack_enabled: bool) -> tuple[str, str]:
+        """Three-phase request:
+          1. Primary attempt with optional 'let me think' ack if slow
+          2. Retry primary with 'sorry, one moment' ack
+          3. Silent fallback to FALLBACK model"""
+        result_holder: dict = {}
+
+        def attempt(model, key):
+            try:
+                result_holder[key] = ("ok", self._claude_try_once(model, prompt))
+            except Exception as e:
+                result_holder[key] = ("err", str(e))
+
+        t1 = threading.Thread(target=attempt,
+                              args=(CLAUDE_MODEL_PRIMARY, "t1"), daemon=True)
+        t1.start()
+
+        t1_start = time.time()
+        ack_played = False
+        while t1.is_alive():
+            if (ack_enabled and not ack_played
+                    and (time.time() - t1_start) >= ACK_DELAY_SECONDS):
+                first_try_wavs = self._ack_wavs.get(
+                    self._get_active_language(), {}).get("first_try", [])
+                if first_try_wavs:
+                    print("[ack] (let me think)")
+                    self._play_cached_wav(random.choice(first_try_wavs))
+                ack_played = True
+            time.sleep(0.05)
+        t1.join(timeout=0.1)
+
+        status, payload = result_holder.get("t1", ("err", "unknown"))
+        if status == "ok" and payload:
+            return (payload, "ok")
+        print(f"[Claude] primary attempt 1 failed/empty: "
+              f"{payload[:120] if payload else '(empty)'}")
+
+        if ack_enabled:
+            second_wav = self._ack_wavs.get(
+                self._get_active_language(), {}).get("second_try")
+            if second_wav:
+                print("[ack] (sorry, one second)")
+                self._play_cached_wav(second_wav)
+
+        try:
+            text = self._claude_try_once(CLAUDE_MODEL_PRIMARY, prompt)
+            if text:
+                return (text, "ok")
+            print("[Claude] primary attempt 2 returned empty.")
+        except Exception as e:
+            print(f"[Claude] primary attempt 2 failed: {e}")
+
+        try:
+            print(f"[Claude] falling back to {CLAUDE_MODEL_FALLBACK}")
+            text = self._claude_try_once(CLAUDE_MODEL_FALLBACK, prompt)
+            if text:
+                return (text, "ok")
+            print("[Claude] fallback returned empty.")
+        except Exception as e:
+            print(f"[Claude] fallback failed: {e}")
+
+        return ("", "failed")
+
+    # --------------------------------------------------------------------
+    # RAG helpers.
+    # --------------------------------------------------------------------
+    def _retrieve_rag_context(self, query: str) -> str:
+        """Semantic search with score threshold. Returns an empty string
+        if no result is confident enough to inject."""
+        results = self.rag.search(query, n=RAG_TOP_K)
+        if not results:
+            print("[RAG] No results.")
+            return ""
+
+        top = results[0]
+        if top["score"] < RAG_SCORE_THRESHOLD:
+            print(f"[RAG] Top result below threshold "
+                  f"({top['score']:.3f} < {RAG_SCORE_THRESHOLD}): "
+                  f"{top['id']} - skipping injection.")
+            return ""
+
+        print(f"[RAG] Injecting {top['id']} (score={top['score']:.3f})")
+        return (
+            "\n[Museum sheet - use this as ground truth]\n"
+            f"{_format_sheet_for_prompt(top['sheet'])}\n"
+            "[End of museum sheet]\n"
+        )
+
+    def _retrieve_rag_by_id(self, artwork_id: str) -> str:
+        """Direct lookup by artwork ID. Used for camera-triggered events."""
+        sheet = self.rag.sheet_by_id(artwork_id)
+        if sheet is None:
+            print(f"[RAG] No sheet for ID {artwork_id}")
+            return ""
+        print(f"[RAG] Injecting {artwork_id} (direct lookup)")
+        return (
+            "\n[Museum sheet - use this as ground truth]\n"
+            f"{_format_sheet_for_prompt(sheet)}\n"
+            "[End of museum sheet]\n"
+        )
+
+    # --------------------------------------------------------------------
+    # Prompts (RAG context injected here).
+    # --------------------------------------------------------------------
+    _skip_instructions = """
+Bystander filter:
+If the visitor's latest line looks like random background chatter, off-topic
+noise (not a real question), or clearly not directed at you, reply with exactly:
+SKIP
+and nothing else.
+
+Otherwise, answer normally as the museum guide.
+"""
+
+    def _build_user_prompt(self, user_text: str) -> str:
+        directive = self._get_active_llm_directive()
+        rag_block = self._retrieve_rag_context(user_text)
+
+        return f"""{self.system_prompt}
+
+LANGUAGE INSTRUCTION: {directive}
+
+{self.formatting_rules}
+
+Conversation so far (most recent last):
+{self._memory_as_transcript()}
+{rag_block}
+Visitor's latest line: {user_text}
+
+{self._skip_instructions}
+
+If you answer, keep it to 1-2 short sentences. Warm and conversational, plain prose.
+Use prior turns when relevant so follow-ups feel natural.
+{directive}
+"""
+
+    def _build_object_prompt(self, object_name: str) -> str:
+        directive = self._get_active_llm_directive()
+        artwork_id = YOLOE_TO_ARTWORK_ID.get(object_name)
+        if artwork_id:
+            rag_block = self._retrieve_rag_by_id(artwork_id)
+        else:
+            rag_block = self._retrieve_rag_context(object_name)
+
+        return f"""{self.system_prompt}
+
+LANGUAGE INSTRUCTION: {directive}
+
+{self.formatting_rules}
+
+Conversation so far (most recent last):
+{self._memory_as_transcript()}
+{rag_block}
+Camera event:
+The visitor has been steadily looking at an object detected as "{object_name}"
+for at least {OBJECT_HOLD_SECONDS} seconds.
+
+Task:
+Give a short, natural museum-guide explanation of "{object_name}".
+Do NOT mention detection or observation; just speak as if you noticed it yourself.
+Keep it to 1-2 short sentences. If unsure, use soft uncertainty.
+This is NOT a bystander event - never reply SKIP for a camera event.
+{directive}
+"""
+
+    # --------------------------------------------------------------------
+    # Request handling.
+    # --------------------------------------------------------------------
+    def _handle_request(self, kind: str, text: str) -> None:
+        if kind == "user":
+            prompt = self._build_user_prompt(text)
+            self._memory_append("user", text)
+            ack_enabled = True
+        elif kind == "object":
+            prompt = self._build_object_prompt(text)
+            self._memory_append("camera", text)
+            ack_enabled = False
+        else:
+            return
+
+        print("[Claude] thinking ...")
+        self.is_busy_event.set()
+        try:
+            response, status = self._claude_request_with_retries(prompt, ack_enabled)
+        except Exception as e:
+            print(f"[Claude] unexpected error: {e}")
+            response, status = "", "failed"
+
+        if status == "failed":
+            failure_wav = self._ack_wavs.get(
+                self._get_active_language(), {}).get("failure")
+            if failure_wav:
+                print("[failure] connection problem")
+                self._play_cached_wav(failure_wav)
+            if kind == "user":
+                with self.memory_lock:
+                    if self.memory and self.memory[-1] == ("user", text):
+                        self.memory.pop()
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+            return
+
+        if not response:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+            return
+
+        if kind == "user":
+            first_token = (
+                response.split(None, 1)[0].strip().rstrip(".").upper()
+                if response else ""
+            )
+            if first_token == "SKIP":
+                print("[Claude] SKIP - bystander noise, staying silent.")
+                with self.memory_lock:
+                    if self.memory and self.memory[-1] == ("user", text):
+                        self.memory.pop()
+                self.is_busy_event.clear()
+                self.last_speak_end_time = time.time()
+                return
+
+        sanitized = self._sanitize_for_tts(response)
+        print(f"[TTS] {sanitized}")
+        self.speak_start_time = time.time()
+        try:
+            self._speak_full(sanitized)
+        finally:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+
+        self._memory_append("assistant", sanitized)
+
+    def _llm_worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                req = self.request_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            self._handle_request(req.get("kind"), req.get("text", ""))
+
+    # --------------------------------------------------------------------
+    # STT - VAD-gated Whisper.
+    #
+    # Flow:
+    #   1. Audio callback drops 100 ms chunks into audio_q.
+    #   2. Main loop pulls each chunk, runs silero VAD on it.
+    #   3. While in speech, accumulate chunks in utt_chunks.
+    #   4. When silence > VAD_MIN_SILENCE_MS, flush utt_chunks to Whisper.
+    # --------------------------------------------------------------------
+    def _listen_forever(self) -> None:
+        audio_q: queue.Queue = queue.Queue()
+
+        def audio_callback(indata, frames, time_info, status):
+            # Drop audio while ATLAS is speaking, to avoid self-hearing.
+            if self.is_busy_event.is_set():
+                return
+            if (time.time() - self.last_speak_end_time) < POST_SPEAK_SETTLE_SECONDS:
+                return
+            samples = np.frombuffer(bytes(indata), dtype=np.int16)
+            audio_q.put(samples)
+
+        # Pre-buffer holds the last few chunks before speech starts,
+        # so we can prepend them when speech is detected and avoid
+        # clipping the first word.
+        pre_buffer_chunks = max(1, VAD_PRE_BUFFER_MS // 100)
+        pre_buffer: deque = deque(maxlen=pre_buffer_chunks)
+
+        utt_chunks: list[np.ndarray] = []
+        utt_start_time: float | None = None
+        last_speech_time: float = 0.0
+        in_speech = False
+
+        try:
+            with sd.RawInputStream(
+                samplerate=MIC_SAMPLE_RATE,
+                blocksize=MIC_BLOCKSIZE,
+                dtype="int16",
+                channels=1,
+                device=MIC_DEVICE,
+                callback=audio_callback,
+            ):
+                print(f"[STT] Listening with Whisper + VAD on device {MIC_DEVICE} "
+                      f"@ {MIC_SAMPLE_RATE} Hz")
+
+                while not self.stop_event.is_set():
+                    try:
+                        chunk = audio_q.get(timeout=0.2)
+                    except queue.Empty:
+                        # If we have a pending utterance and silence has
+                        # lasted long enough, flush it now.
+                        if (in_speech and utt_chunks and
+                                (time.time() - last_speech_time) * 1000
+                                >= VAD_MIN_SILENCE_MS):
+                            self._flush_utterance(utt_chunks, utt_start_time)
+                            utt_chunks = []
+                            utt_start_time = None
+                            in_speech = False
+                        continue
+
+                    # silero VAD expects float32 in [-1, 1] at 16 kHz.
+                    chunk_f = chunk.astype(np.float32) / 32768.0
+                    chunk_tensor = torch.from_numpy(chunk_f)
+
+                    try:
+                        with torch.no_grad():
+                            speech_prob = self.vad_model(
+                                chunk_tensor, MIC_SAMPLE_RATE
+                            ).item()
+                    except Exception as e:
+                        print(f"[VAD] error: {e}")
+                        continue
+
+                    is_speech = speech_prob >= VAD_THRESHOLD
+
+                    if is_speech:
+                        if not in_speech:
+                            # Speech just started - prepend pre-buffer.
+                            in_speech = True
+                            utt_start_time = time.time()
+                            utt_chunks = list(pre_buffer) + [chunk]
+                        else:
+                            utt_chunks.append(chunk)
+                        last_speech_time = time.time()
+                    else:
+                        if in_speech:
+                            # Include trailing silence chunks so Whisper
+                            # has context at the end of the utterance.
+                            utt_chunks.append(chunk)
+                            silence_ms = (time.time() - last_speech_time) * 1000
+                            if silence_ms >= VAD_MIN_SILENCE_MS:
+                                self._flush_utterance(utt_chunks, utt_start_time)
+                                utt_chunks = []
+                                utt_start_time = None
+                                in_speech = False
+                        else:
+                            # Pure silence: keep refreshing the pre-buffer.
+                            pre_buffer.append(chunk)
+        except Exception as e:
+            print(f"[STT] listener error: {e}")
+
+    def _flush_utterance(self, chunks: list[np.ndarray],
+                         start_time: float | None) -> None:
+        """Concatenate audio chunks, run Whisper on them, push the
+        transcription onto the utterance queue."""
+        if not chunks or start_time is None:
+            return
+
+        audio = np.concatenate(chunks).astype(np.float32) / 32768.0
+        duration = len(audio) / MIC_SAMPLE_RATE
+
+        if duration * 1000 < VAD_MIN_SPEECH_MS:
+            return  # too short, probably noise
+
+        lang_iso = self._get_active_iso()
+
+        try:
+            segments, info = self.whisper.transcribe(
+                audio,
+                language=lang_iso,
+                beam_size=1,         # greedy decoding for speed
+                vad_filter=False,    # we already did VAD with silero
+                no_speech_threshold=0.6,
+            )
+            seg_list = list(segments)  # segments is a generator
+        except Exception as e:
+            print(f"[Whisper] transcribe error: {e}")
+            return
+
+        if not seg_list:
+            return
+
+        text = " ".join(s.text for s in seg_list).strip().lower()
+        # Weighted average of segment-level avg_logprob, weighted by text length.
+        total_len = sum(len(s.text) for s in seg_list) or 1
+        weighted_logprob = sum(
+            (s.avg_logprob if s.avg_logprob is not None else -1.0) * len(s.text)
+            for s in seg_list
+        ) / total_len
+        conf = _logprob_to_score(weighted_logprob)
+
+        if not text:
+            return
+
+        # Echo guard: if the utterance window overlaps with ATLAS's
+        # speaking window, drop it.
+        speak_window_start = self.speak_start_time
+        speak_window_end = (
+            self.last_speak_end_time + POST_SPEAK_SETTLE_SECONDS
+        )
+        if (speak_window_start > 0
+                and start_time <= speak_window_end
+                and start_time + duration >= speak_window_start):
+            print(f"[STT] Discarding self-hearing echo: {text!r}")
+            return
+
+        self.utterance_queue.put({
+            "text": text,
+            "conf": conf,
+            "duration": duration,
+        })
+
+    # --------------------------------------------------------------------
+    # Camera worker.
+    # --------------------------------------------------------------------
+    def camera_worker(self) -> None:
+        cap = None
+        try:
+            pipeline = _build_camera_pipeline()
+            print(f"[Camera] Opening pipeline: {pipeline}")
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if not cap.isOpened():
+                raise RuntimeError(
+                    "Camera failed to open via GStreamer pipeline. "
+                    "Check OpenCV's GStreamer support."
+                )
+
+            ret, test_frame = cap.read()
+            if not ret:
+                raise RuntimeError("Camera opened but could not read first frame.")
+            print(f"[Camera] Pipeline up, frame shape: {test_frame.shape}")
+
+            print("[Camera] Loading YOLOE model on CUDA ...")
+            model = YOLOE(self.model_path)
+            model.set_classes(self.prompt_names)
+            try:
+                model.to("cuda")
+                print("[Camera] YOLOE loaded on CUDA.")
+            except Exception as e:
+                print(f"[Camera] WARNING: could not move YOLOE to CUDA, "
+                      f"will run on CPU: {e}")
+
+            frame_idx = 0
+            last_annotated = None
+            last_fps = 0.0
+
+            while not self.stop_event.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
+
+                frame = cv2.resize(frame, CAMERA_PROCESS_SIZE)
+
+                # IMX708 delivers desaturated colors; boost in software.
+                if SATURATION_BOOST != 1.0 or BRIGHTNESS_BOOST != 1.0:
+                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+                    hsv[..., 1] = np.clip(hsv[..., 1] * SATURATION_BOOST, 0, 255)
+                    hsv[..., 2] = np.clip(hsv[..., 2] * BRIGHTNESS_BOOST, 0, 255)
+                    frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+                frame_idx += 1
+                if frame_idx % DETECT_EVERY_N_FRAMES == 0:
+                    results = model.predict(
+                        frame,
+                        imgsz=self.yoloe_imgsz,
+                        verbose=False,
+                        device="cuda",
+                    )
+                    result = results[0]
+                    last_annotated = result.plot(boxes=True, masks=False)
+
+                    detections: list[dict] = []
+                    boxes = result.boxes
+                    if (boxes is not None and boxes.cls is not None
+                            and boxes.conf is not None):
+                        for cls_id, conf in zip(boxes.cls.tolist(),
+                                                boxes.conf.tolist()):
+                            if conf < DETECT_CONFIDENCE_THRESHOLD:
+                                continue
+                            cls_index = int(cls_id)
+                            name = result.names.get(cls_index, str(cls_index))
+                            detections.append({
+                                "name": str(name).lower(),
+                                "confidence": float(conf),
+                            })
+
+                    inference_time = result.speed.get("inference", 0.0)
+                    last_fps = 1000.0 / inference_time if inference_time > 0 else 0.0
+                    self._maybe_trigger_object_explanation(detections)
+
+                display = last_annotated if last_annotated is not None else frame
+
+                lang_label = f"Lang: {self._get_active_language()}"
+                fps_label = f"FPS: {last_fps:.1f}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+
+                cv2.putText(display, lang_label, (10, 30), font, 0.8,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+                ts = cv2.getTextSize(fps_label, font, 0.8, 2)[0]
+                cv2.putText(display, fps_label,
+                            (display.shape[1] - ts[0] - 10, 30),
+                            font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+                try:
+                    cv2.imshow("ATLAS Museum Helmet", display)
+                    if cv2.waitKey(1) == ord("q"):
+                        self.stop_event.set()
+                        break
+                except cv2.error:
+                    cv2.imwrite("/tmp/atlas_latest_frame.jpg", display)
+        except Exception as e:
+            print("Camera worker error:", e)
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+    def _maybe_trigger_object_explanation(self, detections: list[dict]) -> None:
+        current_time = time.time()
+        if detections:
+            summary = ", ".join(
+                f"{d['name']} ({d['confidence']:.2f})" for d in detections
+            )
+            if summary != self.last_terminal_objects:
+                print(f"[Camera detected]: {summary}")
+                self.last_terminal_objects = summary
+        else:
+            if self.last_terminal_objects is not None:
+                print("[Camera detected]: none")
+                self.last_terminal_objects = None
+
+        triggerable = [
+            d for d in detections
+            if d["name"] in TRIGGER_OBJECTS
+            and d["confidence"] >= TRIGGER_CONFIDENCE_THRESHOLD
+        ]
+        if not triggerable:
+            self.last_seen_object = None
+            self.object_first_seen_time = None
+            return
+
+        dominant = max(triggerable, key=lambda d: d["confidence"])
+        dominant_name = dominant["name"]
+
+        if dominant_name != self.last_seen_object:
+            self.last_seen_object = dominant_name
+            self.object_first_seen_time = current_time
+            return
+
+        if self.object_first_seen_time is None:
+            self.object_first_seen_time = current_time
+            return
+
+        held_long_enough = (
+            (current_time - self.object_first_seen_time) >= OBJECT_HOLD_SECONDS
+        )
+        off_cooldown = (
+            (current_time - self.last_object_trigger_time.get(dominant_name, 0.0))
+            >= OBJECT_COOLDOWN_SECONDS
+        )
+
+        if (held_long_enough and off_cooldown and not self.is_busy_event.is_set()
+                and self.request_queue.empty()):
+            print(f"[Camera trigger]: {dominant_name} "
+                  f"(conf={dominant['confidence']:.2f}) "
+                  f"held {OBJECT_HOLD_SECONDS}s - enqueuing")
+            self.last_object_trigger_time[dominant_name] = current_time
+            self.request_queue.put({"kind": "object", "text": dominant_name})
+            self.object_first_seen_time = current_time
+
+    # --------------------------------------------------------------------
+    # Utterance classification.
+    # --------------------------------------------------------------------
+    def _contains_wake_word(self, text: str) -> str | None:
+        for w in WAKE_WORDS:
+            if w in text:
+                return w
+        return None
+
+    def _utterance_passes_noise_gate(self, utt: dict) -> bool:
+        text = utt["text"]
+        conf = utt.get("conf")
+        duration = utt.get("duration", 0.0)
+
+        if self._contains_wake_word(text):
+            return True
+        if self._detect_switch_command(text):
+            return True
+        if self._is_exit_phrase(text):
+            return True
+
+        if len(text.split()) < STT_MIN_WORDS:
+            return False
+        if duration < STT_MIN_SECONDS:
+            return False
+        if conf is not None and conf < WHISPER_MIN_CONF:
+            return False
+        return True
+
+    def _strip_wake_word(self, text: str) -> str:
+        out = text
+        for w in WAKE_WORDS:
+            out = out.replace(w, "", 1)
+        return out.strip()
+
+    # --------------------------------------------------------------------
+    # Main loop.
+    # --------------------------------------------------------------------
+    def start(self) -> None:
+        self._prepare_ack_wavs()
+
+        camera_thread = threading.Thread(target=self.camera_worker, daemon=True)
+        camera_thread.start()
+
+        stt_thread = threading.Thread(target=self._listen_forever, daemon=True)
+        stt_thread.start()
+
+        worker_thread = threading.Thread(target=self._llm_worker, daemon=True)
+        worker_thread.start()
+
+        greeting_wav = self._ack_wavs.get(DEFAULT_LANGUAGE, {}).get("greeting")
+        if greeting_wav:
+            print(f"[greeting in {DEFAULT_LANGUAGE}]")
+            self.is_busy_event.set()
+            self.speak_start_time = time.time()
+            try:
+                self._play_cached_wav(greeting_wav)
+            finally:
+                self.is_busy_event.clear()
+                self.last_speak_end_time = time.time()
+        else:
+            self.say_blocking(LANGUAGES[DEFAULT_LANGUAGE]["greeting"])
+
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    utt = self.utterance_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                text = utt["text"]
+                if not self._utterance_passes_noise_gate(utt):
+                    continue
+
+                print(f"\n[Heard]: {text}  (lang={self._get_active_language()}, "
+                      f"conf={utt.get('conf')}, dur={utt.get('duration', 0):.2f}s)")
+
+                target_lang = self._detect_switch_command(text)
+                if target_lang is not None:
+                    self._switch_language(target_lang)
+                    continue
+
+                if self._is_exit_phrase(text):
+                    exit_wav = self._ack_wavs.get(
+                        self._get_active_language(), {}).get("exit_phrase")
+                    if exit_wav:
+                        print(f"[exit in {self._get_active_language()}]")
+                        self.is_busy_event.set()
+                        self.speak_start_time = time.time()
+                        try:
+                            self._play_cached_wav(exit_wav)
+                        finally:
+                            self.is_busy_event.clear()
+                            self.last_speak_end_time = time.time()
+                    else:
+                        self.say_blocking(
+                            LANGUAGES[self._get_active_language()].get(
+                                "exit_phrase", "Goodbye."
+                            )
+                        )
+                    break
+
+                query = (
+                    self._strip_wake_word(text)
+                    if self._contains_wake_word(text) else text
+                )
+                if not query:
+                    self.say_blocking("Yes?")
+                    continue
+
+                self.request_queue.put({"kind": "user", "text": query})
+        except KeyboardInterrupt:
+            print("\n[Ctrl-C] shutting down.")
+        finally:
+            self.stop_event.set()
+            self._hard_stop_all_audio()
+
+
+if __name__ == "__main__":
+    helmet = MuseumHelmet()
+    helmet.start()
