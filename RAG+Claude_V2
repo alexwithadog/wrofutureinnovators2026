@@ -1,0 +1,1589 @@
+"""
+ATLAS - Museum Helmet (Jetson + Claude + Vosk + RAG)
+=====================================================
+V3: Full V2 profile guidance loaded per language, prompt caching enabled,
+voice-driven profile refinement on top of a sensible default.
+
+Hardware: Jetson Orin Nano (JetPack 6.1, CUDA 12.6), IMX708 camera,
+USB MillSO mic (hw:1,0), USB speaker (plughw:0,0).
+
+Prerequisites:
+  pip install chromadb sentence-transformers anthropic vosk \\
+              sounddevice opencv-python numpy python-dotenv \\
+              ultralytics
+  ANTHROPIC_API_KEY in .env. atlas/ package and data/artworks/ must exist.
+
+Architecture notes:
+  - System prompt = stable V2 core in the active language. Sent with
+    cache_control={"type": "ephemeral"} so Claude reuses it across turns
+    at 10% cost / faster TTFT. 5-minute TTL refreshed on every hit.
+  - User message = dynamic context only (profile, memory, RAG, question).
+    Recomputed every turn but stays small (~300-500 tokens).
+  - Visitor profile starts from a per-language default and is refined
+    via lightweight voice commands ("je suis un enfant", "I'm an expert",
+    "describe more for accessibility", etc).
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import random
+import threading
+import queue
+import subprocess
+import tempfile
+import unicodedata
+from collections import deque
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
+import sounddevice as sd
+import vosk  # type: ignore
+
+from dotenv import load_dotenv
+import anthropic
+from ultralytics import YOLOE  # type: ignore
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from atlas.rag import RAG
+
+vosk.SetLogLevel(-1)
+
+
+# ==========================================================================
+# Tunable constants
+# ==========================================================================
+
+# --- Audio input ---
+MIC_DEVICE = 1
+MIC_NATIVE_RATE = 48000
+MIC_SAMPLE_RATE = 16000
+MIC_BLOCKSIZE = 12000
+
+# --- Audio output ---
+AUDIO_OUT_DEVICE: str | None = "plughw:0,0"
+
+# --- Piper ---
+PIPER_DATA_DIR = os.path.expanduser("~/piper_voices")
+PIPER_LENGTH_SCALE = 1.00
+
+# --- Vosk ---
+STT_MIN_WORDS = 3
+STT_MIN_SECONDS = 1.0
+VOSK_MIN_CONF = 0.55
+POST_SPEAK_SETTLE_SECONDS = 0.60
+
+# --- Wake words ---
+WAKE_WORDS = ("atlas", "helmet", "guide", "assistant")
+
+# --- Memory ---
+MEMORY_TURNS = 10
+
+# --- Vision ---
+DETECT_EVERY_N_FRAMES = 1
+OBJECT_HOLD_SECONDS = 2.0
+OBJECT_COOLDOWN_SECONDS = 8.0
+TRIGGER_OBJECTS = {"mona lisa painting", "vase", "sword", "pharaoh mask"}
+DETECT_CONFIDENCE_THRESHOLD = 0.40
+TRIGGER_CONFIDENCE_THRESHOLD = 0.50
+
+# --- Camera ---
+CAMERA_FLIP = 2
+CAMERA_GST_WIDTH = 4608
+CAMERA_GST_HEIGHT = 2592
+CAMERA_GST_FRAMERATE = 14
+CAMERA_GST_SENSOR_MODE = 0
+CAMERA_PROCESS_SIZE = (1024, 1024)
+YOLOE_IMGSZ = 320
+CAMERA_EXPOSURE_COMP = 1.0
+SATURATION_BOOST = 1.6
+BRIGHTNESS_BOOST = 1.0
+
+# --- Claude ---
+CLAUDE_MODEL_PRIMARY = "claude-haiku-4-5-20251001"
+CLAUDE_MODEL_FALLBACK = "claude-haiku-4-5-20251001"
+CLAUDE_MAX_TOKENS = 300
+ACK_DELAY_SECONDS = 1.5
+
+# --- RAG ---
+RAG_SCORE_THRESHOLD = 0.50
+RAG_TOP_K = 1
+
+YOLOE_TO_ARTWORK_ID = {
+    "mona lisa painting": "artwork_001_mona_lisa",
+    "pharaoh mask": "artwork_003_tutankhamun_mask",
+}
+
+
+# ==========================================================================
+# V2 system prompts (full, per language).
+# Each is the stable core sent with prompt caching enabled.
+# ==========================================================================
+
+SYSTEM_PROMPT_FR = """Tu es ATLAS, un guide museal intelligent integre dans un casque wearable au Musee des beaux-arts de Montreal. Tu parles directement a un visiteur qui se trouve devant une oeuvre, un objet culturel, une sculpture, une photographie, une installation ou un espace d'exposition.
+
+Ta mission principale est la mediation culturelle. Tu aides le visiteur a comprendre ce qu'il regarde, pourquoi c'est important, et ce qui rend l'oeuvre interessante. Tu expliques l'art, les artistes, les techniques, les materiaux, les symboles, les styles, les mouvements artistiques, l'histoire et le contexte culturel avec chaleur, precision et naturel.
+
+Ta mission secondaire est la securite non intrusive. Si le contexte signale un risque evident, comme une personne trop proche d'une oeuvre, un obstacle ou un mouvement dangereux, tu le mentionnes calmement en une phrase courte. Tu ne dramatises pas. Tu ne donnes jamais l'impression de surveiller les visiteurs. Apres l'avertissement, tu reviens a l'experience culturelle.
+
+Tu dois parler comme un vrai guide humain : simple, chaleureux, curieux et vivant. Evite le ton robotique, scolaire, administratif, publicitaire ou encyclopedique. Ne recite pas une fiche. Transforme l'information en explication claire.
+
+Tes reponses doivent etre concues pour etre lues a voix haute par une synthese vocale. Reponds normalement en une ou deux phrases courtes. Utilise trois phrases seulement si le visiteur demande plus de details ou si la clarte l'exige. Ne fais pas de longs monologues.
+
+Quand tu expliques une oeuvre, essaie d'inclure naturellement trois idees : ce que c'est, pourquoi c'est important, et un detail interessant. Ne force pas ces trois elements si la question demande autre chose, mais garde cette structure comme repere.
+
+Adapte toujours ton langage au profil du visiteur. Pour un enfant, utilise des mots simples, des images concretes, des comparaisons faciles et un ton vivant. Pour un adolescent, sois clair, direct et interessant sans etre infantilisant. Pour un adulte debutant, explique simplement avec un peu de contexte. Pour un visiteur avance ou expert, ajoute des details historiques, stylistiques, techniques, symboliques ou curatoriaux. Pour une personne ayant une deficience visuelle, decris davantage les formes, couleurs, positions, textures, dimensions, matieres et ambiance visuelle. Pour une personne ayant des difficultes cognitives ou linguistiques, utilise des phrases tres simples et evite les concepts abstraits non expliques.
+
+Au debut de la visite, tu peux apprendre le profil du visiteur progressivement. Demande au maximum deux informations a la fois. Priorite : langue preferee, niveau d'explication souhaite, niveau de connaissance en art, interets, besoins d'accessibilite, style d'experience prefere. N'attends pas un profil parfait pour commencer a aider.
+
+Ne demande pas le sexe ou le genre par defaut. Ne l'infere jamais a partir de la voix, du nom ou de l'apparence. Si la formulation personnelle devient utile, demande simplement : Comment preferes-tu que je m'adresse a toi ?
+
+Tu peux repondre a toute question raisonnable liee a l'art, l'histoire, la culture, les objets, les artistes, l'architecture, la litterature, la mythologie, la religion, la science, la nature, la geographie, les evenements historiques, les figures historiques, les musees et les connaissances generales qu'un guide museal cultive pourrait expliquer. Tu peux repondre meme si le sujet n'est pas exactement devant le visiteur, tant qu'il reste culturel, educatif ou historique.
+
+Si la question est clairement hors sujet, comme un conseil medical, financier, amoureux, une actualite recente, un resultat sportif en direct, une direction vers une adresse precise ou un debat politique explicite, redirige doucement vers ton role de guide culturel. Ne fais pas la morale. Sois bref.
+
+Utilise les notes de camera comme contexte visuel sur ce que le visiteur regarde maintenant. Si l'identification de l'oeuvre est incertaine, dis-le calmement. Par exemple : Je ne suis pas certain de l'identification exacte, mais cela ressemble a une peinture de paysage. Ensuite, donne quand meme une observation utile a partir du contexte disponible.
+
+Ne pretends jamais connaitre une date, un artiste, un titre, une origine, une interpretation officielle ou un fait precis si cette information n'est pas dans le contexte fourni. Si une information manque, signale doucement l'incertitude et donne une explication generale utile.
+
+Pour les sujets sensibles, comme la guerre, la mort, la colonisation, la religion, la violence ou la souffrance, garde un ton calme, respectueux et humain. Tu peux reconnaitre brievement l'emotion du visiteur, puis expliquer le contexte culturel ou historique sans dramatiser.
+
+Ne mentionne pas spontanement le stockage, l'enregistrement, le suivi ou la surveillance des visiteurs. Si le visiteur pose explicitement une question sur la confidentialite, reponds brievement et honnetement au niveau general, sans details techniques inutiles, puis reviens a l'experience museale.
+
+Tu peux poser une question de suivi courte si elle rend l'echange plus naturel, mais ne termine pas chaque reponse par une question. Priorite a une reponse utile, claire et humaine.
+
+REGLES STRICTES POUR LA SORTIE LUE A VOIX HAUTE : n'utilise jamais de markdown, de listes a puces, de numeros, d'asterisques, de tirets de liste, de titres, de balises, de code ou d'emojis. Ecris seulement du texte parle naturel, comme une personne qui parle a voix haute.
+
+FILTRE DE BRUIT DE FOND : si la derniere ligne du visiteur ressemble a un bavardage de fond aleatoire, du bruit hors sujet qui n'est pas une vraie question, ou clairement pas adresse a toi, reponds exactement par SKIP et rien d'autre. Sinon reponds normalement en guide museal. Les evenements camera ne sont JAMAIS du bruit de fond, ne reponds jamais SKIP pour un evenement camera."""
+
+
+SYSTEM_PROMPT_EN = """You are ATLAS, an intelligent museum guide embedded in a wearable helmet at the Montreal Museum of Fine Arts. You speak directly to a visitor standing in front of an artwork, a cultural object, a sculpture, a photograph, an installation, or an exhibition space.
+
+Your primary mission is cultural mediation. You help the visitor understand what they are looking at, why it matters, and what makes the work interesting. You explain art, artists, techniques, materials, symbols, styles, artistic movements, history, and cultural context with warmth, precision, and naturalness.
+
+Your secondary mission is non-intrusive safety. If the context flags an obvious risk, like a person standing too close to an artwork, an obstacle, or a dangerous movement, you mention it calmly in a single short sentence. You do not dramatize. You never give the impression of monitoring visitors. After the warning, you return to the cultural experience.
+
+You must speak like a real human guide: simple, warm, curious, and alive. Avoid robotic, scholarly, administrative, promotional, or encyclopedic tones. Do not recite a fact sheet. Transform information into a clear explanation.
+
+Your responses must be designed to be read aloud by a speech synthesizer. Respond normally in one or two short sentences. Use three sentences only if the visitor asks for more detail or clarity requires it. Do not deliver long monologues.
+
+When you explain a work, try to naturally include three ideas: what it is, why it matters, and one interesting detail. Do not force these three elements if the question asks for something else, but keep this structure as a reference.
+
+Always adapt your language to the visitor's profile. For a child, use simple words, concrete images, easy comparisons, and a lively tone. For a teenager, be clear, direct, and interesting without being patronizing. For an adult beginner, explain simply with a little context. For an advanced or expert visitor, add historical, stylistic, technical, symbolic, or curatorial details. For a person with a visual impairment, describe more of the shapes, colors, positions, textures, dimensions, materials, and visual atmosphere. For a person with cognitive or linguistic difficulties, use very simple sentences and avoid unexplained abstract concepts.
+
+At the start of the visit, you can learn the visitor's profile progressively. Ask at most two pieces of information at a time. Priorities: preferred language, desired level of explanation, art knowledge level, interests, accessibility needs, preferred experience style. Do not wait for a perfect profile to start helping.
+
+Do not ask for sex or gender by default. Never infer it from voice, name, or appearance. If personal phrasing becomes useful, simply ask: How would you prefer I address you?
+
+You can answer any reasonable question related to art, history, culture, objects, artists, architecture, literature, mythology, religion, science, nature, geography, historical events, historical figures, museums, and the general knowledge a cultivated museum guide could explain. You can answer even if the subject is not exactly in front of the visitor, as long as it remains cultural, educational, or historical.
+
+If the question is clearly off-topic, like medical advice, financial advice, romantic advice, recent news, a live sports score, directions to a specific address, or explicit political debate, gently redirect toward your role as a cultural guide. Do not moralize. Be brief.
+
+Use camera notes as visual context about what the visitor is looking at right now. If identification of the work is uncertain, say so calmly. For example: I am not certain of the exact identification, but this looks like a landscape painting. Then still offer a useful observation based on available context.
+
+Never claim to know a date, an artist, a title, an origin, an official interpretation, or a precise fact if that information is not in the provided context. If information is missing, gently signal uncertainty and give a useful general explanation.
+
+For sensitive subjects, like war, death, colonization, religion, violence, or suffering, keep a calm, respectful, and human tone. You can briefly acknowledge the visitor's emotion, then explain the cultural or historical context without dramatizing.
+
+Do not spontaneously mention storage, recording, tracking, or monitoring of visitors. If the visitor explicitly asks a question about privacy, respond briefly and honestly at a general level, without unnecessary technical detail, then return to the museum experience.
+
+You can ask a short follow-up question if it makes the exchange more natural, but do not end every response with a question. Priority is a useful, clear, human response.
+
+STRICT RULES FOR SPOKEN OUTPUT: never use markdown, bullet lists, numbers, asterisks, list dashes, titles, tags, code, or emoji. Write only natural spoken text, like a person speaking aloud.
+
+BACKGROUND NOISE FILTER: if the visitor's latest line looks like random background chatter, off-topic noise that is not a real question, or clearly not addressed to you, reply with exactly SKIP and nothing else. Otherwise answer normally as the museum guide. Camera events are NEVER background noise, never reply SKIP for a camera event."""
+
+
+SYSTEM_PROMPT_ES = """Eres ATLAS, una guia inteligente de museo integrada en un casco wearable en el Museo de Bellas Artes de Montreal. Hablas directamente a un visitante que esta frente a una obra de arte, un objeto cultural, una escultura, una fotografia, una instalacion o un espacio de exposicion.
+
+Tu mision principal es la mediacion cultural. Ayudas al visitante a entender lo que esta mirando, por que es importante y que hace que la obra sea interesante. Explicas arte, artistas, tecnicas, materiales, simbolos, estilos, movimientos artisticos, historia y contexto cultural con calidez, precision y naturalidad.
+
+Tu mision secundaria es la seguridad no intrusiva. Si el contexto senala un riesgo evidente, como una persona demasiado cerca de una obra, un obstaculo o un movimiento peligroso, lo mencionas con calma en una sola frase corta. No dramatizas. Nunca das la impresion de vigilar a los visitantes. Despues del aviso, vuelves a la experiencia cultural.
+
+Debes hablar como un verdadero guia humano: simple, calido, curioso y vivo. Evita el tono robotico, escolar, administrativo, publicitario o enciclopedico. No recites una ficha. Transforma la informacion en una explicacion clara.
+
+Tus respuestas deben estar disenadas para ser leidas en voz alta por un sintetizador de voz. Responde normalmente en una o dos frases cortas. Usa tres frases solo si el visitante pide mas detalle o la claridad lo exige. No hagas largos monologos.
+
+Cuando expliques una obra, intenta incluir naturalmente tres ideas: que es, por que es importante y un detalle interesante. No fuerces estos tres elementos si la pregunta pide otra cosa, pero mantenlos como referencia.
+
+Adapta siempre tu lenguaje al perfil del visitante. Para un nino, usa palabras simples, imagenes concretas, comparaciones faciles y un tono vivo. Para un adolescente, se claro, directo e interesante sin ser condescendiente. Para un adulto principiante, explica de forma simple con algo de contexto. Para un visitante avanzado o experto, anade detalles historicos, estilisticos, tecnicos, simbolicos o curatoriales. Para una persona con discapacidad visual, describe mas las formas, colores, posiciones, texturas, dimensiones, materiales y ambiente visual. Para una persona con dificultades cognitivas o linguisticas, usa frases muy simples y evita conceptos abstractos no explicados.
+
+Al inicio de la visita, puedes aprender el perfil del visitante progresivamente. Pide como maximo dos informaciones a la vez. Prioridad: idioma preferido, nivel de explicacion deseado, nivel de conocimiento de arte, intereses, necesidades de accesibilidad, estilo de experiencia preferido. No esperes un perfil perfecto para empezar a ayudar.
+
+No preguntes el sexo o el genero por defecto. Nunca lo infieras a partir de la voz, el nombre o la apariencia. Si la formulacion personal resulta util, pregunta simplemente: Como prefieres que me dirija a ti?
+
+Puedes responder a cualquier pregunta razonable relacionada con arte, historia, cultura, objetos, artistas, arquitectura, literatura, mitologia, religion, ciencia, naturaleza, geografia, eventos historicos, figuras historicas, museos y el conocimiento general que un guia museal culto podria explicar. Puedes responder incluso si el tema no esta exactamente frente al visitante, mientras siga siendo cultural, educativo o historico.
+
+Si la pregunta es claramente fuera de tema, como consejo medico, consejo financiero, consejo amoroso, noticias recientes, un resultado deportivo en vivo, indicaciones a una direccion precisa o un debate politico explicito, redirige suavemente hacia tu rol de guia cultural. No moralices. Se breve.
+
+Usa las notas de camara como contexto visual sobre lo que el visitante esta mirando ahora. Si la identificacion de la obra es incierta, dilo con calma. Por ejemplo: No estoy seguro de la identificacion exacta, pero esto parece una pintura de paisaje. Despues, ofrece igualmente una observacion util basada en el contexto disponible.
+
+Nunca pretendas conocer una fecha, un artista, un titulo, un origen, una interpretacion oficial o un dato preciso si esa informacion no esta en el contexto proporcionado. Si falta informacion, senala suavemente la incertidumbre y da una explicacion general util.
+
+Para temas sensibles, como la guerra, la muerte, la colonizacion, la religion, la violencia o el sufrimiento, manten un tono calmo, respetuoso y humano. Puedes reconocer brevemente la emocion del visitante, luego explicar el contexto cultural o historico sin dramatizar.
+
+No menciones espontaneamente el almacenamiento, la grabacion, el seguimiento o la vigilancia de los visitantes. Si el visitante pregunta explicitamente sobre privacidad, responde de forma breve y honesta a nivel general, sin detalles tecnicos innecesarios, luego vuelve a la experiencia del museo.
+
+Puedes hacer una pregunta breve de seguimiento si hace que el intercambio sea mas natural, pero no termines cada respuesta con una pregunta. Prioridad a una respuesta util, clara y humana.
+
+REGLAS ESTRICTAS PARA LA SALIDA HABLADA: nunca uses markdown, listas con vinetas, numeros, asteriscos, guiones de lista, titulos, etiquetas, codigo o emojis. Escribe solo texto hablado natural, como una persona hablando en voz alta.
+
+FILTRO DE RUIDO DE FONDO: si la ultima linea del visitante parece charla aleatoria de fondo, ruido fuera de tema que no es una pregunta real, o claramente no esta dirigida a ti, responde exactamente con SKIP y nada mas. Si no, responde normalmente como guia museal. Los eventos de camara NUNCA son ruido de fondo, nunca respondas SKIP a un evento de camara."""
+
+
+# ==========================================================================
+# Multilanguage definitions
+# ==========================================================================
+
+LANGUAGES: dict[str, dict] = {
+    "english": {
+        "vosk_model": "/opt/vosk_models/vosk-model-small-en-us-0.15",
+        "piper_voice": "en_US-ryan-low",
+        "system_prompt": SYSTEM_PROMPT_EN,
+        "switch_phrases": [
+            "switch to english", "speak english", "english please", "in english",
+            "passez a l anglais", "passe a l anglais", "passe en anglais",
+            "passez en anglais", "parle anglais", "en anglais",
+            "cambia al ingles", "cambiar al ingles", "habla ingles",
+            "en ingles", "ingles por favor",
+        ],
+        "exit_phrases": [
+            "goodbye", "good bye", "exit", "quit", "stop program", "see you",
+        ],
+        "ack_first": [
+            "Let me think.",
+            "One moment please.",
+            "Good question, give me a second.",
+        ],
+        "ack_second": "Sorry, one second, let me think.",
+        "failure": "There's a problem with the connection right now. Please try again in a moment.",
+        "switch_confirmation": "Switching to English.",
+        "exit_phrase": "Goodbye.",
+        "greeting": (
+            "Hi, I'm Atlas, your museum guide. You can ask me anything about art, "
+            "history, or culture, or just stop in front of an exhibit and I'll tell you about it."
+        ),
+        "llm_directive": "Respond ONLY in English.",
+        # Voice-driven profile refinement phrases.
+        # Format: list of (phrase, profile_field, value).
+        "profile_phrases": [
+            ("i am a child", "age_group", "child"),
+            ("i'm a child", "age_group", "child"),
+            ("for a child", "age_group", "child"),
+            ("i am a teenager", "age_group", "teenager"),
+            ("i'm a teenager", "age_group", "teenager"),
+            ("i am an adult", "age_group", "adult"),
+            ("i'm an adult", "age_group", "adult"),
+            ("i am a beginner", "art_level", "beginner"),
+            ("i'm a beginner", "art_level", "beginner"),
+            ("i am an expert", "art_level", "expert"),
+            ("i'm an expert", "art_level", "expert"),
+            ("explain simply", "explanation_level", "simple"),
+            ("simple explanations", "explanation_level", "simple"),
+            ("explain in detail", "explanation_level", "advanced"),
+            ("more detail", "explanation_level", "advanced"),
+            ("describe more", "accessibility", "visual_description"),
+            ("i can't see well", "accessibility", "visual_description"),
+            ("i cannot see well", "accessibility", "visual_description"),
+            ("speak slower", "accessibility", "slow_audio"),
+            ("speak slowly", "accessibility", "slow_audio"),
+        ],
+        "profile_default": {
+            "age_group": "adult",
+            "art_level": "beginner",
+            "explanation_level": "normal",
+            "accessibility": [],
+            "interests": [],
+            "style": "warm",
+        },
+        # Localized profile descriptor template for the user message.
+        "profile_template": (
+            "Visitor profile:\n"
+            "- Age group: {age_group}\n"
+            "- Art knowledge: {art_level}\n"
+            "- Explanation level: {explanation_level}\n"
+            "- Accessibility needs: {accessibility}\n"
+            "- Interests: {interests}\n"
+            "- Preferred style: {style}\n"
+        ),
+        "profile_ack": "Got it, I'll adjust how I explain things.",
+    },
+    "french": {
+        "vosk_model": "/opt/vosk_models/vosk-model-small-fr-0.22",
+        "piper_voice": "fr_FR-siwis-medium",
+        "system_prompt": SYSTEM_PROMPT_FR,
+        "switch_phrases": [
+            "passez au francais", "passe au francais", "passe en francais",
+            "passez en francais", "parle francais", "en francais",
+            "francais s il vous plait",
+            "switch to french", "speak french", "french please", "in french",
+            "cambia al frances", "cambiar al frances", "habla frances",
+            "en frances", "frances por favor",
+        ],
+        "exit_phrases": [
+            "au revoir", "salut", "a bientot", "termine", "quitte",
+            "arrete le programme",
+        ],
+        "ack_first": [
+            "Laisse-moi reflechir.",
+            "Un instant, s'il vous plait.",
+            "Bonne question, un moment.",
+        ],
+        "ack_second": "Desole, un moment, je reflechis.",
+        "failure": "Il y a un probleme de connexion en ce moment. Veuillez reessayer dans un instant.",
+        "switch_confirmation": "Je passe au francais.",
+        "exit_phrase": "Au revoir.",
+        "greeting": (
+            "Bonjour, je suis Atlas, votre guide de musee. Vous pouvez me poser "
+            "n'importe quelle question sur l'art, l'histoire ou la culture."
+        ),
+        "llm_directive": "Respond ONLY in French.",
+        "profile_phrases": [
+            ("je suis un enfant", "age_group", "child"),
+            ("je suis une enfant", "age_group", "child"),
+            ("pour un enfant", "age_group", "child"),
+            ("je suis adolescent", "age_group", "teenager"),
+            ("je suis adolescente", "age_group", "teenager"),
+            ("je suis un ado", "age_group", "teenager"),
+            ("je suis adulte", "age_group", "adult"),
+            ("je suis debutant", "art_level", "beginner"),
+            ("je suis debutante", "art_level", "beginner"),
+            ("je suis expert", "art_level", "expert"),
+            ("je suis experte", "art_level", "expert"),
+            ("explique simplement", "explanation_level", "simple"),
+            ("explications simples", "explanation_level", "simple"),
+            ("plus de details", "explanation_level", "advanced"),
+            ("explique en detail", "explanation_level", "advanced"),
+            ("decris plus", "accessibility", "visual_description"),
+            ("je vois mal", "accessibility", "visual_description"),
+            ("je ne vois pas bien", "accessibility", "visual_description"),
+            ("parle plus lentement", "accessibility", "slow_audio"),
+            ("plus lentement", "accessibility", "slow_audio"),
+        ],
+        "profile_default": {
+            "age_group": "adulte",
+            "art_level": "debutant",
+            "explanation_level": "normal",
+            "accessibility": [],
+            "interests": [],
+            "style": "chaleureux",
+        },
+        "profile_template": (
+            "Profil du visiteur :\n"
+            "- Groupe d'age : {age_group}\n"
+            "- Connaissance en art : {art_level}\n"
+            "- Niveau d'explication : {explanation_level}\n"
+            "- Besoins d'accessibilite : {accessibility}\n"
+            "- Interets : {interests}\n"
+            "- Style prefere : {style}\n"
+        ),
+        "profile_ack": "Compris, j'adapte mes explications.",
+    },
+    "spanish": {
+        "vosk_model": "/opt/vosk_models/vosk-model-small-es-0.42",
+        "piper_voice": "es_MX-claude-high",
+        "system_prompt": SYSTEM_PROMPT_ES,
+        "switch_phrases": [
+            "cambia al espanol", "cambiar al espanol", "habla espanol",
+            "en espanol", "espanol por favor",
+            "pasa al espanol", "pasar al espanol",
+            "switch to spanish", "speak spanish", "spanish please", "in spanish",
+            "passez a l espagnol", "passe a l espagnol", "passe en espagnol",
+            "parle espagnol", "en espagnol",
+        ],
+        "exit_phrases": [
+            "adios", "hasta luego", "hasta la vista", "salir",
+            "termina el programa",
+        ],
+        "ack_first": [
+            "Dejame pensar.",
+            "Un momento, por favor.",
+            "Buena pregunta, un momento.",
+        ],
+        "ack_second": "Disculpe, un momento, estoy pensando.",
+        "failure": "Hay un problema de conexion ahora mismo. Por favor, intentelo de nuevo en un momento.",
+        "switch_confirmation": "Cambiando al espanol.",
+        "exit_phrase": "Adios.",
+        "greeting": (
+            "Hola, soy Atlas, su guia del museo. Puede preguntarme cualquier cosa "
+            "sobre arte, historia o cultura."
+        ),
+        "llm_directive": "Respond ONLY in Spanish.",
+        "profile_phrases": [
+            ("soy un nino", "age_group", "child"),
+            ("soy una nina", "age_group", "child"),
+            ("para un nino", "age_group", "child"),
+            ("soy adolescente", "age_group", "teenager"),
+            ("soy adulto", "age_group", "adult"),
+            ("soy adulta", "age_group", "adult"),
+            ("soy principiante", "art_level", "beginner"),
+            ("soy experto", "art_level", "expert"),
+            ("soy experta", "art_level", "expert"),
+            ("explica simple", "explanation_level", "simple"),
+            ("explicaciones simples", "explanation_level", "simple"),
+            ("mas detalle", "explanation_level", "advanced"),
+            ("explica en detalle", "explanation_level", "advanced"),
+            ("describe mas", "accessibility", "visual_description"),
+            ("no veo bien", "accessibility", "visual_description"),
+            ("habla mas despacio", "accessibility", "slow_audio"),
+            ("mas despacio", "accessibility", "slow_audio"),
+        ],
+        "profile_default": {
+            "age_group": "adulto",
+            "art_level": "principiante",
+            "explanation_level": "normal",
+            "accessibility": [],
+            "interests": [],
+            "style": "calido",
+        },
+        "profile_template": (
+            "Perfil del visitante:\n"
+            "- Grupo de edad: {age_group}\n"
+            "- Conocimiento de arte: {art_level}\n"
+            "- Nivel de explicacion: {explanation_level}\n"
+            "- Necesidades de accesibilidad: {accessibility}\n"
+            "- Intereses: {interests}\n"
+            "- Estilo preferido: {style}\n"
+        ),
+        "profile_ack": "Entendido, ajusto mis explicaciones.",
+    },
+}
+
+DEFAULT_LANGUAGE = "english"
+
+
+# ==========================================================================
+# Visitor profile (mutable, per-language defaults applied on language switch).
+# ==========================================================================
+
+@dataclass
+class VisitorProfile:
+    age_group: str = "adult"
+    art_level: str = "beginner"
+    explanation_level: str = "normal"
+    accessibility: list[str] = field(default_factory=list)
+    interests: list[str] = field(default_factory=list)
+    style: str = "warm"
+
+    def apply_default(self, defaults: dict) -> None:
+        """Reset to per-language default values."""
+        self.age_group = defaults["age_group"]
+        self.art_level = defaults["art_level"]
+        self.explanation_level = defaults["explanation_level"]
+        self.accessibility = list(defaults["accessibility"])
+        self.interests = list(defaults["interests"])
+        self.style = defaults["style"]
+
+    def update_field(self, field_name: str, value: str) -> bool:
+        """Apply a voice-detected profile update. Returns True if the
+        profile actually changed (used to decide whether to ack)."""
+        if field_name == "accessibility":
+            if value not in self.accessibility:
+                self.accessibility.append(value)
+                return True
+            return False
+        if field_name in ("age_group", "art_level", "explanation_level", "style"):
+            old = getattr(self, field_name)
+            if old != value:
+                setattr(self, field_name, value)
+                return True
+            return False
+        return False
+
+    def format_for_prompt(self, template: str) -> str:
+        return template.format(
+            age_group=self.age_group,
+            art_level=self.art_level,
+            explanation_level=self.explanation_level,
+            accessibility=", ".join(self.accessibility) if self.accessibility else "none",
+            interests=", ".join(self.interests) if self.interests else "none specified",
+            style=self.style,
+        )
+
+
+# ==========================================================================
+# Module-level helpers
+# ==========================================================================
+
+def _strip_accents(text: str) -> str:
+    text = (text or "").lower().strip()
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
+    try:
+        subprocess.run(
+            [
+                "python3", "-m", "piper",
+                "--model", voice,
+                "--data-dir", PIPER_DATA_DIR,
+                "--length-scale", str(PIPER_LENGTH_SCALE),
+                "--output-file", out_path,
+            ],
+            input=text.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _build_camera_pipeline() -> str:
+    return (
+        f"nvarguscamerasrc sensor-id=0 sensor-mode={CAMERA_GST_SENSOR_MODE} "
+        f"wbmode=1 aelock=false ee-mode=1 tnr-mode=1 "
+        f"exposurecompensation={CAMERA_EXPOSURE_COMP} ! "
+        f"video/x-raw(memory:NVMM),width={CAMERA_GST_WIDTH},height={CAMERA_GST_HEIGHT},"
+        f"framerate={CAMERA_GST_FRAMERATE}/1 ! "
+        f"nvvidconv flip-method={CAMERA_FLIP} ! "
+        f"video/x-raw,width=1280,height=720,format=BGRx ! "
+        f"videoconvert ! "
+        f"video/x-raw,format=BGR ! "
+        f"appsink drop=true max-buffers=2"
+    )
+
+
+def _format_sheet_for_prompt(sheet: dict) -> str:
+    return (
+        f"Title: {sheet.get('title', '')}\n"
+        f"Artist: {sheet.get('artist', '')}\n"
+        f"Year: {sheet.get('year', '')}\n"
+        f"Description: {sheet.get('long_description', '')}\n"
+        f"Historical context: {sheet.get('historical_context', '')}\n"
+        f"Themes: {', '.join(sheet.get('themes', []))}\n"
+        f"Anecdote: {sheet.get('anecdote', '')}\n"
+    )
+
+
+class MuseumHelmet:
+    def __init__(self):
+        load_dotenv()
+
+        # --- Claude client ---
+        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not self.anthropic_api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY not set. Put it in .env.")
+        self.client = anthropic.Anthropic(api_key=self.anthropic_api_key)
+
+        # --- RAG ---
+        print("[RAG] Initializing RAG (downloads embedding model on first run)...")
+        self.rag = RAG()
+        print(f"[RAG] Collection size: {self.rag.collection.count()} sheet(s)")
+
+        # --- Vosk: load ALL language models at startup ---
+        self.vosk_models: dict[str, vosk.Model] = {}
+        for lang_name, cfg in LANGUAGES.items():
+            path = cfg["vosk_model"]
+            if not os.path.isdir(path):
+                raise RuntimeError(
+                    f"Vosk model for {lang_name} not found at {path}."
+                )
+            print(f"[STT] Loading Vosk model for {lang_name} from {path} ...")
+            self.vosk_models[lang_name] = vosk.Model(path)
+        print("[STT] All Vosk models loaded.")
+
+        # --- Active language state ---
+        self.current_language = DEFAULT_LANGUAGE
+        self.language_lock = threading.Lock()
+        self.language_change_event = threading.Event()
+
+        # --- Visitor profile (starts at default for default language) ---
+        self.profile = VisitorProfile()
+        self.profile.apply_default(LANGUAGES[DEFAULT_LANGUAGE]["profile_default"])
+        self.profile_lock = threading.Lock()
+
+        # --- YOLOE ---
+        self.model_path = "yoloe-11s-seg.pt"
+        self.prompt_names = [
+            "mona lisa painting", "vase", "sword", "pharaoh mask",
+            "person", "face", "hand", "background wall",
+        ]
+        self.yoloe_imgsz = YOLOE_IMGSZ
+
+        self.last_seen_object = None
+        self.object_first_seen_time = None
+        self.last_object_trigger_time = {name: 0.0 for name in self.prompt_names}
+        self.last_terminal_objects = None
+
+        # --- Inter-thread state ---
+        self.utterance_queue: queue.Queue = queue.Queue()
+        self.request_queue: queue.Queue = queue.Queue()
+
+        self.stop_event = threading.Event()
+        self.is_busy_event = threading.Event()
+
+        self.speak_start_time = 0.0
+        self.last_speak_end_time = 0.0
+
+        self._proc_lock = threading.Lock()
+        self._piper_proc: subprocess.Popen | None = None
+        self._aplay_proc: subprocess.Popen | None = None
+
+        # --- Memory ---
+        self.memory: deque = deque(maxlen=MEMORY_TURNS * 2 + 5)
+        self.memory_lock = threading.Lock()
+
+        # --- Pre-rendered ack WAVs per language ---
+        self._ack_wavs: dict[str, dict] = {}
+        self._ack_tempdir = tempfile.mkdtemp(prefix="atlas_ack_")
+
+        self.formatting_rules = """
+CRITICAL OUTPUT FORMAT RULES - these are read aloud by a text-to-speech engine:
+- Do NOT use asterisks (*), underscores (_), backticks (`), or any markdown.
+- Do NOT use bold, italics, or any emphasis markers.
+- Do NOT use bullet points, numbered lists, or dashes for lists.
+- Do NOT use headers, titles, or section labels.
+- Do NOT use emoji.
+- Write ONLY plain spoken prose - continuous sentences, like a person talking.
+"""
+
+    # --------------------------------------------------------------------
+    # Pre-render acknowledgment WAVs
+    # --------------------------------------------------------------------
+    def _prepare_ack_wavs(self) -> None:
+        print("[Piper] Pre-rendering acknowledgment audio for all languages...")
+        for lang_name, cfg in LANGUAGES.items():
+            voice = cfg["piper_voice"]
+            self._ack_wavs[lang_name] = {"first_try": []}
+
+            for i, phrase in enumerate(cfg["ack_first"]):
+                path = os.path.join(self._ack_tempdir, f"ack_first_{lang_name}_{i}.wav")
+                if _piper_synthesize(voice, phrase, path):
+                    self._ack_wavs[lang_name]["first_try"].append(path)
+
+            for key in ("ack_second", "failure", "switch_confirmation",
+                        "greeting", "exit_phrase", "profile_ack"):
+                path = os.path.join(self._ack_tempdir, f"{key}_{lang_name}.wav")
+                if _piper_synthesize(voice, cfg[key], path):
+                    self._ack_wavs[lang_name][key] = path
+
+            print(f"[Piper] Acknowledgments ready for {lang_name}.")
+        print("[Piper] All language acknowledgments ready.")
+
+    def _play_cached_wav(self, wav_path: str) -> None:
+        if not wav_path or not os.path.exists(wav_path):
+            return
+        aplay_cmd = ["aplay", "-q"]
+        if AUDIO_OUT_DEVICE:
+            aplay_cmd += ["-D", AUDIO_OUT_DEVICE]
+        aplay_cmd.append(wav_path)
+        try:
+            with self._proc_lock:
+                self._aplay_proc = subprocess.Popen(
+                    aplay_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self._aplay_proc.wait()
+        finally:
+            with self._proc_lock:
+                self._aplay_proc = None
+
+    # --------------------------------------------------------------------
+    # Memory
+    # --------------------------------------------------------------------
+    def _memory_append(self, role: str, text: str) -> None:
+        with self.memory_lock:
+            self.memory.append((role, text))
+
+    def _memory_as_transcript(self) -> str:
+        with self.memory_lock:
+            items = list(self.memory)
+        lines = []
+        for role, text in items:
+            if role == "user":
+                lines.append(f"Visitor: {text}")
+            elif role == "assistant":
+                lines.append(f"Guide: {text}")
+            elif role == "camera":
+                lines.append(f"[Camera] Visitor is now looking at: {text}")
+        return "\n".join(lines) if lines else "(no prior turns)"
+
+    # --------------------------------------------------------------------
+    # Active language helpers
+    # --------------------------------------------------------------------
+    def _get_active_language(self) -> str:
+        with self.language_lock:
+            return self.current_language
+
+    def _get_active_voice(self) -> str:
+        return LANGUAGES[self._get_active_language()]["piper_voice"]
+
+    def _get_active_llm_directive(self) -> str:
+        return LANGUAGES[self._get_active_language()]["llm_directive"]
+
+    def _get_active_system_prompt(self) -> str:
+        return LANGUAGES[self._get_active_language()]["system_prompt"]
+
+    def _switch_language(self, new_lang: str) -> None:
+        if new_lang not in LANGUAGES:
+            print(f"[Lang] unknown language: {new_lang}")
+            return
+        with self.language_lock:
+            if new_lang == self.current_language:
+                print(f"[Lang] already in {new_lang}")
+                return
+            print(f"[Lang] switching {self.current_language} -> {new_lang}")
+            self.current_language = new_lang
+
+        # Re-apply default profile in the new language (so age_group label
+        # matches the new language's vocabulary, e.g. "adulte" vs "adult").
+        # We preserve accessibility needs since those are language-agnostic.
+        with self.profile_lock:
+            preserved_accessibility = list(self.profile.accessibility)
+            self.profile.apply_default(LANGUAGES[new_lang]["profile_default"])
+            self.profile.accessibility = preserved_accessibility
+
+        self.language_change_event.set()
+        self.is_busy_event.set()
+        self.speak_start_time = time.time()
+        try:
+            wav = self._ack_wavs.get(new_lang, {}).get("switch_confirmation")
+            if wav:
+                self._play_cached_wav(wav)
+        finally:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+
+    def _detect_switch_command(self, text: str) -> str | None:
+        normalized = _strip_accents(text)
+        for lang_name, cfg in LANGUAGES.items():
+            for phrase in cfg["switch_phrases"]:
+                if _strip_accents(phrase) in normalized:
+                    return lang_name
+        return None
+
+    def _is_exit_phrase(self, text: str) -> bool:
+        normalized = _strip_accents(text)
+        cfg = LANGUAGES[self._get_active_language()]
+        for phrase in cfg.get("exit_phrases", []):
+            if _strip_accents(phrase) in normalized:
+                return True
+        return False
+
+    # --------------------------------------------------------------------
+    # Voice-driven profile refinement
+    # --------------------------------------------------------------------
+    def _detect_profile_update(self, text: str) -> list[tuple[str, str]]:
+        """Scan text for profile-update phrases in the active language.
+        Returns a list of (field_name, value) tuples to apply. Empty list
+        if no profile phrase was detected."""
+        normalized = _strip_accents(text)
+        cfg = LANGUAGES[self._get_active_language()]
+        updates = []
+        for phrase, field_name, value in cfg.get("profile_phrases", []):
+            if _strip_accents(phrase) in normalized:
+                updates.append((field_name, value))
+        return updates
+
+    def _apply_profile_updates(self, updates: list[tuple[str, str]]) -> bool:
+        """Apply detected updates to the visitor profile. Returns True if
+        any update actually changed the profile (so we ack)."""
+        changed = False
+        with self.profile_lock:
+            for field_name, value in updates:
+                if self.profile.update_field(field_name, value):
+                    changed = True
+        if changed:
+            print(f"[Profile] updated: {updates}")
+            with self.profile_lock:
+                print(f"[Profile] now: age={self.profile.age_group}, "
+                      f"art={self.profile.art_level}, "
+                      f"explain={self.profile.explanation_level}, "
+                      f"access={self.profile.accessibility}")
+        return changed
+
+    # --------------------------------------------------------------------
+    # TTS
+    # --------------------------------------------------------------------
+    def _sanitize_for_tts(self, text: str) -> str:
+        if not text:
+            return text
+        text = re.sub(r"[*_`~]", "", text)
+        text = re.sub(r"^\s*[-•]+\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^\s*\d+[.)]\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _speak_full(self, text: str) -> None:
+        text = self._sanitize_for_tts(text)
+        if not text:
+            return
+
+        voice = self._get_active_voice()
+
+        # Slow audio accessibility: increase length scale dynamically.
+        length_scale = PIPER_LENGTH_SCALE
+        with self.profile_lock:
+            if "slow_audio" in self.profile.accessibility:
+                length_scale = 1.25
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+            wav_path = tmp_wav.name
+
+        try:
+            piper_cmd = [
+                "python3", "-m", "piper",
+                "--model", voice,
+                "--data-dir", PIPER_DATA_DIR,
+                "--length-scale", str(length_scale),
+                "--output-file", wav_path,
+            ]
+            with self._proc_lock:
+                self._piper_proc = subprocess.Popen(
+                    piper_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            try:
+                if self._piper_proc.stdin:
+                    self._piper_proc.stdin.write(text.encode("utf-8"))
+                    self._piper_proc.stdin.close()
+            except Exception:
+                pass
+            self._piper_proc.wait()
+            with self._proc_lock:
+                self._piper_proc = None
+
+            if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+                return
+
+            aplay_cmd = ["aplay", "-q"]
+            if AUDIO_OUT_DEVICE:
+                aplay_cmd += ["-D", AUDIO_OUT_DEVICE]
+            aplay_cmd.append(wav_path)
+
+            with self._proc_lock:
+                self._aplay_proc = subprocess.Popen(
+                    aplay_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self._aplay_proc.wait()
+            with self._proc_lock:
+                self._aplay_proc = None
+        finally:
+            if os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
+
+    def _hard_stop_all_audio(self) -> None:
+        with self._proc_lock:
+            for p in (self._piper_proc, self._aplay_proc):
+                if p and p.poll() is None:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+
+    def say_blocking(self, text: str) -> None:
+        print(f"[TTS] {text}")
+        self.is_busy_event.set()
+        self.speak_start_time = time.time()
+        try:
+            self._speak_full(text)
+        finally:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+
+    # --------------------------------------------------------------------
+    # Claude with prompt caching
+    # --------------------------------------------------------------------
+    def _claude_try_once(self, model: str, user_message: str) -> str:
+        """One Claude call with streaming + prompt caching.
+
+        The system prompt is sent as a cacheable block with
+        cache_control={"type": "ephemeral"}. After the first call,
+        subsequent calls within ~5 minutes get the cached system prompt
+        at 10% cost and lower TTFT. The user message stays uncached
+        because it changes every turn.
+        """
+        system_blocks = [
+            {
+                "type": "text",
+                "text": self._get_active_system_prompt(),
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+        chunks: list[str] = []
+        with self.client.messages.stream(
+            model=model,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            system=system_blocks,
+            messages=[{"role": "user", "content": user_message}],
+        ) as stream:
+            for text in stream.text_stream:
+                if text:
+                    chunks.append(text)
+        return "".join(chunks).strip()
+
+    def _claude_request_with_retries(self, user_message: str,
+                                     ack_enabled: bool) -> tuple[str, str]:
+        result_holder: dict = {}
+
+        def attempt(model, key):
+            try:
+                result_holder[key] = ("ok", self._claude_try_once(model, user_message))
+            except Exception as e:
+                result_holder[key] = ("err", str(e))
+
+        t1 = threading.Thread(target=attempt,
+                              args=(CLAUDE_MODEL_PRIMARY, "t1"), daemon=True)
+        t1.start()
+
+        t1_start = time.time()
+        ack_played = False
+        while t1.is_alive():
+            if (ack_enabled and not ack_played
+                    and (time.time() - t1_start) >= ACK_DELAY_SECONDS):
+                first_try_wavs = self._ack_wavs.get(
+                    self._get_active_language(), {}).get("first_try", [])
+                if first_try_wavs:
+                    print("[ack] (let me think)")
+                    self._play_cached_wav(random.choice(first_try_wavs))
+                ack_played = True
+            time.sleep(0.05)
+        t1.join(timeout=0.1)
+
+        status, payload = result_holder.get("t1", ("err", "unknown"))
+        if status == "ok" and payload:
+            return (payload, "ok")
+        print(f"[Claude] primary attempt 1 failed/empty: "
+              f"{payload[:120] if payload else '(empty)'}")
+
+        if ack_enabled:
+            second_wav = self._ack_wavs.get(
+                self._get_active_language(), {}).get("ack_second")
+            if second_wav:
+                print("[ack] (sorry, one second)")
+                self._play_cached_wav(second_wav)
+
+        try:
+            text = self._claude_try_once(CLAUDE_MODEL_PRIMARY, user_message)
+            if text:
+                return (text, "ok")
+            print("[Claude] primary attempt 2 returned empty.")
+        except Exception as e:
+            print(f"[Claude] primary attempt 2 failed: {e}")
+
+        try:
+            print(f"[Claude] falling back to {CLAUDE_MODEL_FALLBACK}")
+            text = self._claude_try_once(CLAUDE_MODEL_FALLBACK, user_message)
+            if text:
+                return (text, "ok")
+            print("[Claude] fallback returned empty.")
+        except Exception as e:
+            print(f"[Claude] fallback failed: {e}")
+
+        return ("", "failed")
+
+    # --------------------------------------------------------------------
+    # RAG helpers
+    # --------------------------------------------------------------------
+    def _retrieve_rag_context(self, query: str) -> str:
+        results = self.rag.search(query, n=RAG_TOP_K)
+        if not results:
+            print("[RAG] No results.")
+            return ""
+
+        top = results[0]
+        if top["score"] < RAG_SCORE_THRESHOLD:
+            print(f"[RAG] Top result below threshold "
+                  f"({top['score']:.3f} < {RAG_SCORE_THRESHOLD}): "
+                  f"{top['id']} - skipping injection.")
+            return ""
+
+        print(f"[RAG] Injecting {top['id']} (score={top['score']:.3f})")
+        return (
+            "\n[Museum sheet - use this as ground truth]\n"
+            f"{_format_sheet_for_prompt(top['sheet'])}\n"
+            "[End of museum sheet]\n"
+        )
+
+    def _retrieve_rag_by_id(self, artwork_id: str) -> str:
+        sheet = self.rag.sheet_by_id(artwork_id)
+        if sheet is None:
+            print(f"[RAG] No sheet for ID {artwork_id}")
+            return ""
+        print(f"[RAG] Injecting {artwork_id} (direct lookup)")
+        return (
+            "\n[Museum sheet - use this as ground truth]\n"
+            f"{_format_sheet_for_prompt(sheet)}\n"
+            "[End of museum sheet]\n"
+        )
+
+    # --------------------------------------------------------------------
+    # User message builders (dynamic, uncached part of the prompt).
+    # The system prompt (V2) carries all the heavy guidance and is cached;
+    # the user message only carries what changes per turn: profile,
+    # memory, RAG, and the visitor's input.
+    # --------------------------------------------------------------------
+    def _build_user_message_for_question(self, user_text: str) -> str:
+        directive = self._get_active_llm_directive()
+        cfg = LANGUAGES[self._get_active_language()]
+        rag_block = self._retrieve_rag_context(user_text)
+
+        with self.profile_lock:
+            profile_block = self.profile.format_for_prompt(cfg["profile_template"])
+
+        return f"""{profile_block}
+Conversation so far (most recent last):
+{self._memory_as_transcript()}
+{rag_block}
+Visitor's latest line: {user_text}
+
+{self.formatting_rules}
+
+If you answer, keep it to 1-2 short sentences. Warm and conversational, plain prose. Use prior turns when relevant. {directive}
+"""
+
+    def _build_user_message_for_object(self, object_name: str) -> str:
+        directive = self._get_active_llm_directive()
+        cfg = LANGUAGES[self._get_active_language()]
+
+        artwork_id = YOLOE_TO_ARTWORK_ID.get(object_name)
+        if artwork_id:
+            rag_block = self._retrieve_rag_by_id(artwork_id)
+        else:
+            rag_block = self._retrieve_rag_context(object_name)
+
+        with self.profile_lock:
+            profile_block = self.profile.format_for_prompt(cfg["profile_template"])
+
+        return f"""{profile_block}
+Conversation so far (most recent last):
+{self._memory_as_transcript()}
+{rag_block}
+Camera event:
+The visitor has been steadily looking at an object detected as "{object_name}" for at least {OBJECT_HOLD_SECONDS} seconds.
+
+Task:
+Give a short, natural museum-guide explanation of "{object_name}". Do NOT mention detection or observation; just speak as if you noticed it yourself. Keep it to 1-2 short sentences. If unsure, use soft uncertainty. This is NOT background chatter - never reply SKIP.
+
+{self.formatting_rules}
+
+{directive}
+"""
+
+    # --------------------------------------------------------------------
+    # Request handling
+    # --------------------------------------------------------------------
+    def _handle_request(self, kind: str, text: str) -> None:
+        if kind == "user":
+            user_message = self._build_user_message_for_question(text)
+            self._memory_append("user", text)
+            ack_enabled = True
+        elif kind == "object":
+            user_message = self._build_user_message_for_object(text)
+            self._memory_append("camera", text)
+            ack_enabled = False
+        else:
+            return
+
+        print("[Claude] thinking ...")
+        self.is_busy_event.set()
+        try:
+            response, status = self._claude_request_with_retries(user_message, ack_enabled)
+        except Exception as e:
+            print(f"[Claude] unexpected error: {e}")
+            response, status = "", "failed"
+
+        if status == "failed":
+            failure_wav = self._ack_wavs.get(
+                self._get_active_language(), {}).get("failure")
+            if failure_wav:
+                print("[failure] connection problem")
+                self._play_cached_wav(failure_wav)
+            if kind == "user":
+                with self.memory_lock:
+                    if self.memory and self.memory[-1] == ("user", text):
+                        self.memory.pop()
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+            return
+
+        if not response:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+            return
+
+        if kind == "user":
+            first_token = (
+                response.split(None, 1)[0].strip().rstrip(".").upper()
+                if response else ""
+            )
+            if first_token == "SKIP":
+                print("[Claude] SKIP - bystander noise, staying silent.")
+                with self.memory_lock:
+                    if self.memory and self.memory[-1] == ("user", text):
+                        self.memory.pop()
+                self.is_busy_event.clear()
+                self.last_speak_end_time = time.time()
+                return
+
+        sanitized = self._sanitize_for_tts(response)
+        print(f"[TTS] {sanitized}")
+        self.speak_start_time = time.time()
+        try:
+            self._speak_full(sanitized)
+        finally:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+
+        self._memory_append("assistant", sanitized)
+
+    def _llm_worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                req = self.request_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            self._handle_request(req.get("kind"), req.get("text", ""))
+
+    # --------------------------------------------------------------------
+    # STT
+    # --------------------------------------------------------------------
+    def _listen_forever(self) -> None:
+        audio_q: queue.Queue = queue.Queue()
+
+        if MIC_NATIVE_RATE % MIC_SAMPLE_RATE != 0:
+            raise RuntimeError(
+                "MIC_NATIVE_RATE must be integer multiple of MIC_SAMPLE_RATE."
+            )
+        decim = MIC_NATIVE_RATE // MIC_SAMPLE_RATE
+
+        def audio_callback(indata, frames, time_info, status):
+            if self.is_busy_event.is_set():
+                return
+            if (time.time() - self.last_speak_end_time) < POST_SPEAK_SETTLE_SECONDS:
+                return
+            samples = np.frombuffer(bytes(indata), dtype=np.int16)
+            if decim > 1:
+                samples = samples[::decim]
+            audio_q.put(samples.tobytes())
+
+        while not self.stop_event.is_set():
+            try:
+                active_lang = self._get_active_language()
+                model = self.vosk_models[active_lang]
+                recognizer = vosk.KaldiRecognizer(model, MIC_SAMPLE_RATE)
+                recognizer.SetWords(True)
+                self.language_change_event.clear()
+
+                with sd.RawInputStream(
+                    samplerate=MIC_NATIVE_RATE,
+                    blocksize=MIC_BLOCKSIZE,
+                    dtype="int16",
+                    channels=1,
+                    device=MIC_DEVICE,
+                    callback=audio_callback,
+                ):
+                    print(f"[STT] Listening in {active_lang} on device {MIC_DEVICE} "
+                          f"@ {MIC_NATIVE_RATE} Hz -> {MIC_SAMPLE_RATE} Hz")
+
+                    utt_start: float | None = None
+                    was_busy = False
+
+                    while not self.stop_event.is_set():
+                        if self.language_change_event.is_set():
+                            print("[STT] Language change detected, "
+                                  "reloading recognizer.")
+                            break
+
+                        busy_now = self.is_busy_event.is_set()
+                        if busy_now and not was_busy:
+                            recognizer.Reset()
+                            utt_start = None
+                            while not audio_q.empty():
+                                try:
+                                    audio_q.get_nowait()
+                                except queue.Empty:
+                                    break
+                        was_busy = busy_now
+
+                        try:
+                            data = audio_q.get(timeout=0.2)
+                        except queue.Empty:
+                            continue
+
+                        if utt_start is None:
+                            utt_start = time.time()
+
+                        if recognizer.AcceptWaveform(data):
+                            result = json.loads(recognizer.Result())
+                            text = (result.get("text") or "").strip().lower()
+                            conf = self._avg_word_conf(result.get("result"))
+                            duration = time.time() - (utt_start or time.time())
+                            my_start = utt_start or time.time()
+                            utt_start = None
+
+                            if not text:
+                                continue
+
+                            speak_window_start = self.speak_start_time
+                            speak_window_end = (
+                                self.last_speak_end_time + POST_SPEAK_SETTLE_SECONDS
+                            )
+                            if (speak_window_start > 0
+                                    and my_start <= speak_window_end
+                                    and my_start + duration >= speak_window_start):
+                                print(f"[STT] Discarding self-hearing echo: {text!r}")
+                                continue
+
+                            self.utterance_queue.put({
+                                "text": text,
+                                "conf": conf,
+                                "duration": duration,
+                            })
+            except Exception as e:
+                print(f"[STT] listener error: {e}. Restarting in 0.5s.")
+                time.sleep(0.5)
+
+    @staticmethod
+    def _avg_word_conf(words) -> float | None:
+        if not isinstance(words, list) or not words:
+            return None
+        confs = [w.get("conf") for w in words if isinstance(w, dict) and "conf" in w]
+        if not confs:
+            return None
+        return sum(confs) / len(confs)
+
+    # --------------------------------------------------------------------
+    # Camera worker
+    # --------------------------------------------------------------------
+    def camera_worker(self) -> None:
+        cap = None
+        try:
+            pipeline = _build_camera_pipeline()
+            print(f"[Camera] Opening pipeline: {pipeline}")
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if not cap.isOpened():
+                raise RuntimeError(
+                    "Camera failed to open via GStreamer pipeline. "
+                    "Check OpenCV's GStreamer support."
+                )
+
+            ret, test_frame = cap.read()
+            if not ret:
+                raise RuntimeError("Camera opened but could not read first frame.")
+            print(f"[Camera] Pipeline up, frame shape: {test_frame.shape}")
+
+            print("[Camera] Loading YOLOE model on CUDA ...")
+            model = YOLOE(self.model_path)
+            model.set_classes(self.prompt_names)
+            try:
+                model.to("cuda")
+                print("[Camera] YOLOE loaded on CUDA.")
+            except Exception as e:
+                print(f"[Camera] WARNING: could not move YOLOE to CUDA, "
+                      f"will run on CPU: {e}")
+
+            frame_idx = 0
+            last_annotated = None
+            last_fps = 0.0
+
+            while not self.stop_event.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
+
+                frame = cv2.resize(frame, CAMERA_PROCESS_SIZE)
+
+                if SATURATION_BOOST != 1.0 or BRIGHTNESS_BOOST != 1.0:
+                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+                    hsv[..., 1] = np.clip(hsv[..., 1] * SATURATION_BOOST, 0, 255)
+                    hsv[..., 2] = np.clip(hsv[..., 2] * BRIGHTNESS_BOOST, 0, 255)
+                    frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+                frame_idx += 1
+                if frame_idx % DETECT_EVERY_N_FRAMES == 0:
+                    results = model.predict(
+                        frame,
+                        imgsz=self.yoloe_imgsz,
+                        verbose=False,
+                        device="cuda",
+                    )
+                    result = results[0]
+                    last_annotated = result.plot(boxes=True, masks=False)
+
+                    detections: list[dict] = []
+                    boxes = result.boxes
+                    if (boxes is not None and boxes.cls is not None
+                            and boxes.conf is not None):
+                        for cls_id, conf in zip(boxes.cls.tolist(),
+                                                boxes.conf.tolist()):
+                            if conf < DETECT_CONFIDENCE_THRESHOLD:
+                                continue
+                            cls_index = int(cls_id)
+                            name = result.names.get(cls_index, str(cls_index))
+                            detections.append({
+                                "name": str(name).lower(),
+                                "confidence": float(conf),
+                            })
+
+                    inference_time = result.speed.get("inference", 0.0)
+                    last_fps = 1000.0 / inference_time if inference_time > 0 else 0.0
+                    self._maybe_trigger_object_explanation(detections)
+
+                display = last_annotated if last_annotated is not None else frame
+
+                lang_label = f"Lang: {self._get_active_language()}"
+                fps_label = f"FPS: {last_fps:.1f}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+
+                cv2.putText(display, lang_label, (10, 30), font, 0.8,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+                ts = cv2.getTextSize(fps_label, font, 0.8, 2)[0]
+                cv2.putText(display, fps_label,
+                            (display.shape[1] - ts[0] - 10, 30),
+                            font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+                # Profile overlay (bottom-left, small).
+                with self.profile_lock:
+                    profile_label = (
+                        f"Profile: {self.profile.age_group}/"
+                        f"{self.profile.art_level}/"
+                        f"{self.profile.explanation_level}"
+                    )
+                    if self.profile.accessibility:
+                        profile_label += f" [{','.join(self.profile.accessibility)}]"
+                cv2.putText(display, profile_label,
+                            (10, display.shape[0] - 15),
+                            font, 0.5, (200, 220, 255), 1, cv2.LINE_AA)
+
+                try:
+                    cv2.imshow("ATLAS Museum Helmet", display)
+                    if cv2.waitKey(1) == ord("q"):
+                        self.stop_event.set()
+                        break
+                except cv2.error:
+                    cv2.imwrite("/tmp/atlas_latest_frame.jpg", display)
+        except Exception as e:
+            print("Camera worker error:", e)
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+    def _maybe_trigger_object_explanation(self, detections: list[dict]) -> None:
+        current_time = time.time()
+        if detections:
+            summary = ", ".join(
+                f"{d['name']} ({d['confidence']:.2f})" for d in detections
+            )
+            if summary != self.last_terminal_objects:
+                print(f"[Camera detected]: {summary}")
+                self.last_terminal_objects = summary
+        else:
+            if self.last_terminal_objects is not None:
+                print("[Camera detected]: none")
+                self.last_terminal_objects = None
+
+        triggerable = [
+            d for d in detections
+            if d["name"] in TRIGGER_OBJECTS
+            and d["confidence"] >= TRIGGER_CONFIDENCE_THRESHOLD
+        ]
+        if not triggerable:
+            self.last_seen_object = None
+            self.object_first_seen_time = None
+            return
+
+        dominant = max(triggerable, key=lambda d: d["confidence"])
+        dominant_name = dominant["name"]
+
+        if dominant_name != self.last_seen_object:
+            self.last_seen_object = dominant_name
+            self.object_first_seen_time = current_time
+            return
+
+        if self.object_first_seen_time is None:
+            self.object_first_seen_time = current_time
+            return
+
+        held_long_enough = (
+            (current_time - self.object_first_seen_time) >= OBJECT_HOLD_SECONDS
+        )
+        off_cooldown = (
+            (current_time - self.last_object_trigger_time.get(dominant_name, 0.0))
+            >= OBJECT_COOLDOWN_SECONDS
+        )
+
+        if (held_long_enough and off_cooldown and not self.is_busy_event.is_set()
+                and self.request_queue.empty()):
+            print(f"[Camera trigger]: {dominant_name} "
+                  f"(conf={dominant['confidence']:.2f}) "
+                  f"held {OBJECT_HOLD_SECONDS}s - enqueuing")
+            self.last_object_trigger_time[dominant_name] = current_time
+            self.request_queue.put({"kind": "object", "text": dominant_name})
+            self.object_first_seen_time = current_time
+
+    # --------------------------------------------------------------------
+    # Utterance classification
+    # --------------------------------------------------------------------
+    def _contains_wake_word(self, text: str) -> str | None:
+        for w in WAKE_WORDS:
+            if w in text:
+                return w
+        return None
+
+    def _utterance_passes_noise_gate(self, utt: dict) -> bool:
+        text = utt["text"]
+        conf = utt.get("conf")
+        duration = utt.get("duration", 0.0)
+
+        if self._contains_wake_word(text):
+            return True
+        if self._detect_switch_command(text):
+            return True
+        if self._is_exit_phrase(text):
+            return True
+        # Profile updates always pass too - short commands like "i'm a child"
+        # need to get through even if they fail the word count gate.
+        if self._detect_profile_update(text):
+            return True
+
+        if len(text.split()) < STT_MIN_WORDS:
+            return False
+        if duration < STT_MIN_SECONDS:
+            return False
+        if conf is not None and conf < VOSK_MIN_CONF:
+            return False
+        return True
+
+    def _strip_wake_word(self, text: str) -> str:
+        out = text
+        for w in WAKE_WORDS:
+            out = out.replace(w, "", 1)
+        return out.strip()
+
+    # --------------------------------------------------------------------
+    # Main loop
+    # --------------------------------------------------------------------
+    def start(self) -> None:
+        self._prepare_ack_wavs()
+
+        camera_thread = threading.Thread(target=self.camera_worker, daemon=True)
+        camera_thread.start()
+
+        stt_thread = threading.Thread(target=self._listen_forever, daemon=True)
+        stt_thread.start()
+
+        worker_thread = threading.Thread(target=self._llm_worker, daemon=True)
+        worker_thread.start()
+
+        greeting_wav = self._ack_wavs.get(DEFAULT_LANGUAGE, {}).get("greeting")
+        if greeting_wav:
+            print(f"[greeting in {DEFAULT_LANGUAGE}]")
+            self.is_busy_event.set()
+            self.speak_start_time = time.time()
+            try:
+                self._play_cached_wav(greeting_wav)
+            finally:
+                self.is_busy_event.clear()
+                self.last_speak_end_time = time.time()
+        else:
+            self.say_blocking(LANGUAGES[DEFAULT_LANGUAGE]["greeting"])
+
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    utt = self.utterance_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                text = utt["text"]
+                if not self._utterance_passes_noise_gate(utt):
+                    continue
+
+                print(f"\n[Heard]: {text}  (lang={self._get_active_language()}, "
+                      f"conf={utt.get('conf')}, dur={utt.get('duration', 0):.2f}s)")
+
+                # 1. Switch command - highest priority.
+                target_lang = self._detect_switch_command(text)
+                if target_lang is not None:
+                    self._switch_language(target_lang)
+                    continue
+
+                # 2. Exit phrases.
+                if self._is_exit_phrase(text):
+                    exit_wav = self._ack_wavs.get(
+                        self._get_active_language(), {}).get("exit_phrase")
+                    if exit_wav:
+                        print(f"[exit in {self._get_active_language()}]")
+                        self.is_busy_event.set()
+                        self.speak_start_time = time.time()
+                        try:
+                            self._play_cached_wav(exit_wav)
+                        finally:
+                            self.is_busy_event.clear()
+                            self.last_speak_end_time = time.time()
+                    else:
+                        self.say_blocking(
+                            LANGUAGES[self._get_active_language()].get(
+                                "exit_phrase", "Goodbye."
+                            )
+                        )
+                    break
+
+                # 3. Profile updates - apply, ack briefly, do NOT enqueue
+                # an LLM call. The visitor said "I'm a child", they
+                # don't need a Claude response, just confirmation.
+                profile_updates = self._detect_profile_update(text)
+                if profile_updates:
+                    changed = self._apply_profile_updates(profile_updates)
+                    if changed:
+                        ack_wav = self._ack_wavs.get(
+                            self._get_active_language(), {}).get("profile_ack")
+                        if ack_wav:
+                            self.is_busy_event.set()
+                            self.speak_start_time = time.time()
+                            try:
+                                self._play_cached_wav(ack_wav)
+                            finally:
+                                self.is_busy_event.clear()
+                                self.last_speak_end_time = time.time()
+                    # If profile didn't change, treat it as a normal
+                    # question (the phrase happened to contain trigger
+                    # words but the values were already set).
+                    # We continue here either way - profile commands
+                    # are not questions.
+                    continue
+
+                # 4. Regular question.
+                query = (
+                    self._strip_wake_word(text)
+                    if self._contains_wake_word(text) else text
+                )
+                if not query:
+                    self.say_blocking("Yes?")
+                    continue
+
+                self.request_queue.put({"kind": "user", "text": query})
+        except KeyboardInterrupt:
+            print("\n[Ctrl-C] shutting down.")
+        finally:
+            self.stop_event.set()
+            self._hard_stop_all_audio()
+
+
+if __name__ == "__main__":
+    helmet = MuseumHelmet()
+    helmet.start()
