@@ -1,0 +1,14 @@
+{
+  "id": "mona_lisa",
+  "title": "Mona Lisa",
+  "artist": "Leonardo da Vinci",
+  "year": "circa 1503-1519",
+  "medium": "Oil on poplar wood panel",
+  "dimensions": "77 cm x 53 cm",
+  "location": "Louvre Museum, Paris",
+  "short_description": "A half-length portrait of a woman with an enigmatic smile, set against an imaginary landscape.",
+  "long_description": "The Mona Lisa is a half-length portrait by the Italian Renaissance artist Leonardo da Vinci. The subject is believed to be Lisa Gherardini, the wife of a Florentine merchant. The painting is renowned for the subject's elusive smile, the subtle modeling of forms using a technique called sfumato, and the dreamlike landscape behind her.",
+  "historical_context": "Painted during the Italian Renaissance, the Mona Lisa reflects the era's renewed interest in humanism, naturalism, and the careful observation of light and atmosphere. Leonardo worked on the painting over many years and may never have considered it finished. It was acquired by King Francis I of France and has been in the French royal and later national collection ever since.",
+  "themes": ["portrait", "Renaissance", "sfumato", "humanism", "psychology"],
+  "anecdote": "The painting was stolen from the Louvre in 1911 by an Italian handyman named Vincenzo Peruggia who hid it under his coat. It was missing for over two years before being recovered."
+}
