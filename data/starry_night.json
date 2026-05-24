@@ -1,0 +1,14 @@
+{
+  "id": "starry_night",
+  "title": "The Starry Night",
+  "artist": "Vincent van Gogh",
+  "year": "1889",
+  "medium": "Oil on canvas",
+  "dimensions": "73.7 cm x 92.1 cm",
+  "location": "Museum of Modern Art, New York",
+  "short_description": "A swirling night sky over a quiet village, painted in thick expressive brushstrokes.",
+  "long_description": "The Starry Night depicts the view from the east-facing window of Vincent van Gogh's room at the Saint-Paul-de-Mausole asylum in Saint-Remy-de-Provence, where he was recovering from a mental breakdown. The painting shows a turbulent night sky filled with swirling clouds and bright stars over a peaceful village.",
+  "historical_context": "Van Gogh painted The Starry Night during a difficult period of his life, while voluntarily committed to a psychiatric hospital. The work represents his personal vision of the night sky rather than a literal record of it.",
+  "themes": ["post-impressionism", "night sky", "mental health", "expressionism", "nature"],
+  "anecdote": "Van Gogh painted the scene during the day from memory, using only his imagination and his recollections of the view from his asylum window."
+}
