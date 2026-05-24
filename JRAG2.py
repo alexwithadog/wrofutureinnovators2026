@@ -1149,3 +1149,64 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         held_long_enough = (current_time - self.object_first_seen_time) >= OBJECT_HOLD_SECONDS
         off_cooldown = (current_time - self.last_object_trigger_time.get(dominant_name, 0.0)) >= OBJECT_COOLDOWN_SECONDS
         if held_long_enough:
+            busy = self.is_busy_event.is_set()
+            queue_empty = self.request_queue.empty()
+            if not (off_cooldown and not busy and queue_empty):
+                return
+            print(f"[Camera trigger]: {dominant_name} (conf={dominant['confidence']:.2f})")
+            self.last_object_trigger_time[dominant_name] = current_time
+            threading.Thread(target=self._motor_raise, args=(dominant_name,), daemon=True).start()
+            self.request_queue.put({"kind": "object", "text": dominant_name})
+            self.object_first_seen_time = current_time
+
+    def start(self) -> None:
+        self._prepare_ack_wavs()
+        print("[Motor] Starting background connection to EV3 ...")
+        self.motor.connect_in_background()
+
+        camera_thread = threading.Thread(target=self.camera_worker, daemon=True)
+        camera_thread.start()
+        stt_thread = threading.Thread(target=self._listen_forever, daemon=True)
+        stt_thread.start()
+        transcribe_thread = threading.Thread(target=self._transcribe_worker, daemon=True)
+        transcribe_thread.start()
+        worker_thread = threading.Thread(target=self._gemini_worker, daemon=True)
+        worker_thread.start()
+        motor_idle_thread = threading.Thread(target=self._motor_idle_watcher, daemon=True)
+        motor_idle_thread.start()
+
+        self._run_profile_flow()
+
+        try:
+            while not self.stop_event.is_set():
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            print("\n[Ctrl-C] shutting down.")
+        finally:
+            self.stop_event.set()
+            self._hard_stop_all_audio()
+            try:
+                self._motor_lower_all()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    helmet = MuseumHelmet()
+
+    def _emergency_shutdown(signum, frame):
+        print("\n[Shutdown] Forcing immediate exit...")
+        helmet.stop_event.set()
+        helmet._hard_stop_all_audio()
+        try:
+            helmet._motor_lower_all()
+        except Exception:
+            pass
+        os.system("pkill -9 -f piper 2>/dev/null")
+        os.system("pkill -9 aplay 2>/dev/null")
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _emergency_shutdown)
+    signal.signal(signal.SIGTERM, _emergency_shutdown)
+
+    helmet.start()
