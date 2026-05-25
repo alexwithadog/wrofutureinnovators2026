@@ -61,8 +61,8 @@ ACK_CACHE_DIR = os.path.expanduser("~/.atlas_ack_cache")
 
 EV3_MAC = "2C:6B:7D:7B:AE:02"
 YOLO_TO_SLOT = {
-    "mona_lisa":    "slot_1",
-    "starry_night": "slot_2",
+    "starry_night": "slot_1",
+    "mona_lisa":    "slot_2",
     "pharaoh_mask": "slot_3",
 }
 
@@ -241,7 +241,8 @@ YOLO_TO_ARTWORK_ID = {
     "pharaoh_mask": "pharaoh_mask",
 }
 
-PROFILE_MAX_RETRIES = 2
+PROFILE_MAX_RETRIES = 1
+PROFILE_LISTEN_TIMEOUT_SECONDS = 12.0
 PROFILE_DEFAULT = {
     "age": "adult",
     "profession": "curious visitor",
@@ -277,6 +278,42 @@ def _artwork_spoken_name(artwork_id: str) -> str:
 
 def _object_threshold(thresholds: dict[str, float], object_name: str, default: float) -> float:
     return thresholds.get(object_name, default)
+
+
+def _parse_age(text: str) -> int | None:
+    norm = _strip_accents(text)
+    norm = re.sub(r"[^a-z0-9]+", " ", norm)
+    match = re.search(r"\b(\d{1,3})\b", norm)
+    if match:
+        age = int(match.group(1))
+        return age if 0 < age < 120 else None
+
+    number_words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+        "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+        "nineteen": 19, "twenty": 20,
+        "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4,
+        "cinq": 5, "six": 6, "sept": 7, "huit": 8, "neuf": 9,
+        "dix": 10, "onze": 11, "douze": 12, "treize": 13,
+        "quatorze": 14, "quinze": 15, "seize": 16, "dix sept": 17,
+        "dix huit": 18, "dix neuf": 19, "vingt": 20,
+        "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4,
+        "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9,
+        "diez": 10, "once": 11, "doce": 12, "trece": 13,
+        "catorce": 14, "quince": 15, "dieciseis": 16, "diecisiete": 17,
+        "dieciocho": 18, "diecinueve": 19, "veinte": 20,
+        "uno": 1, "due": 2, "tre": 3, "quattro": 4, "cinque": 5,
+        "sei": 6, "sette": 7, "otto": 8, "nove": 9, "dieci": 10,
+        "undici": 11, "dodici": 12, "tredici": 13, "quattordici": 14,
+        "quindici": 15, "sedici": 16, "diciassette": 17,
+        "diciotto": 18, "diciannove": 19, "venti": 20,
+    }
+    for word, value in sorted(number_words.items(), key=lambda item: len(item[0]), reverse=True):
+        if re.search(r"\b" + re.escape(word) + r"\b", norm):
+            return value
+    return None
 
 
 def _is_reboot_phrase(text: str) -> bool:
@@ -518,9 +555,21 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                 self._motor_lower_all()
 
     def _prepare_ack_wavs(self) -> None:
-        print(f"[Piper] Checking acknowledgment cache at {ACK_CACHE_DIR} ...")
+        print(f"[Piper] Checking local phrase cache at {ACK_CACHE_DIR} ...")
         rendered = 0
         cached = 0
+        phrase_keys = [
+            ("second_try", "ack_second"),
+            ("failure", "failure"),
+            ("greeting", "greeting"),
+            ("ask_age", "ask_age"),
+            ("ask_profession", "ask_profession"),
+            ("ask_interest", "ask_interest"),
+            ("profile_thanks", "profile_thanks"),
+            ("reboot_ack", "reboot_ack"),
+            ("didnt_catch", "didnt_catch"),
+            ("exit_phrase", "exit_phrase"),
+        ]
         for lang_name, cfg in LANGUAGES.items():
             voice = cfg["piper_voice"]
             self._ack_wavs[lang_name] = {"first_try": []}
@@ -533,7 +582,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                         cached += 1
                     else:
                         rendered += 1
-            for kind, src_key in [("second_try", "ack_second"), ("failure", "failure"), ("greeting", "greeting"), ("exit_phrase", "exit_phrase")]:
+            for kind, src_key in phrase_keys:
                 path = os.path.join(ACK_CACHE_DIR, f"{kind}_{lang_name}.wav")
                 already = os.path.exists(path) and os.path.getsize(path) > 0
                 if _ensure_ack_wav(voice, cfg[src_key], path):
@@ -542,7 +591,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                         cached += 1
                     else:
                         rendered += 1
-        print(f"[Piper] Acknowledgments ready. Cached: {cached}, newly rendered: {rendered}.")
+        print(f"[Piper] Local phrases ready. Cached: {cached}, newly rendered: {rendered}.")
 
     def _play_cached_wav(self, wav_path: str) -> None:
         if not wav_path or not os.path.exists(wav_path):
@@ -682,6 +731,22 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
         self.speak_start_time = time.time()
         try:
             self._speak_full(text)
+        finally:
+            self.is_busy_event.clear()
+            self.last_speak_end_time = time.time()
+
+    def say_phrase_blocking(self, phrase_key: str) -> None:
+        lang = self._get_active_language()
+        text = LANGUAGES[lang].get(phrase_key, "")
+        wav_path = self._ack_wavs.get(lang, {}).get(phrase_key)
+        print(f"[TTS] {text}")
+        self.is_busy_event.set()
+        self.speak_start_time = time.time()
+        try:
+            if wav_path:
+                self._play_cached_wav(wav_path)
+            else:
+                self._speak_full(text)
         finally:
             self.is_busy_event.clear()
             self.last_speak_end_time = time.time()
@@ -1016,7 +1081,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             return
         self.request_queue.put({"kind": "user", "text": text})
 
-    def _wait_for_profile_utterance(self, timeout_seconds: float = 30.0) -> np.ndarray | None:
+    def _wait_for_profile_utterance(self, timeout_seconds: float = PROFILE_LISTEN_TIMEOUT_SECONDS) -> np.ndarray | None:
         try:
             item = self.profile_inbox.get(timeout=timeout_seconds)
             return item["audio"]
@@ -1030,20 +1095,20 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             except queue.Empty:
                 break
 
-    def _ask_and_capture(self, prompt_text: str, retries: int = PROFILE_MAX_RETRIES) -> str | None:
+    def _ask_and_capture(self, phrase_key: str, retries: int = PROFILE_MAX_RETRIES) -> str | None:
         for attempt in range(retries + 1):
-            self.say_blocking(prompt_text)
+            self.say_phrase_blocking(phrase_key)
             self._drain_profile_inbox()
-            audio = self._wait_for_profile_utterance(timeout_seconds=30.0)
+            audio = self._wait_for_profile_utterance()
             if audio is None:
                 if attempt < retries:
-                    self.say_blocking(LANGUAGES[self._get_active_language()]["didnt_catch"])
+                    self.say_phrase_blocking("didnt_catch")
                     continue
                 return None
             text, lang_code = self._transcribe_audio(audio)
             if not text:
                 if attempt < retries:
-                    self.say_blocking(LANGUAGES[self._get_active_language()]["didnt_catch"])
+                    self.say_phrase_blocking("didnt_catch")
                     continue
                 return None
             if _is_reboot_phrase(text):
@@ -1059,17 +1124,22 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         self._drain_profile_inbox()
         new_profile: dict[str, str] = {}
         try:
-            self.say_blocking(LANGUAGES[self._get_active_language()]["greeting"])
-            age_text = self._ask_and_capture(LANGUAGES[self._get_active_language()]["ask_age"])
+            self.say_phrase_blocking("greeting")
+            age_text = self._ask_and_capture("ask_age")
             new_profile["age"] = age_text or PROFILE_DEFAULT["age"]
-            prof_text = self._ask_and_capture(LANGUAGES[self._get_active_language()]["ask_profession"])
-            new_profile["profession"] = prof_text or PROFILE_DEFAULT["profession"]
-            interest_text = self._ask_and_capture(LANGUAGES[self._get_active_language()]["ask_interest"])
+            age_value = _parse_age(age_text or "")
+            if age_value is not None and age_value < 20:
+                new_profile["profession"] = "student"
+                print("[Profile] Age under 20, assuming profession: student")
+            else:
+                prof_text = self._ask_and_capture("ask_profession")
+                new_profile["profession"] = prof_text or PROFILE_DEFAULT["profession"]
+            interest_text = self._ask_and_capture("ask_interest")
             new_profile["interest"] = interest_text or PROFILE_DEFAULT["interest"]
             with self.profile_lock:
                 self.visitor_profile = new_profile
             print(f"[Profile] Collected: {new_profile}")
-            self.say_blocking(LANGUAGES[self._get_active_language()]["profile_thanks"])
+            self.say_phrase_blocking("profile_thanks")
         except _RebootRequested:
             print("[Profile] Reboot during profile flow, restarting.")
             self.in_profile_flow.clear()
@@ -1091,7 +1161,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         self._motor_lower_all()
         with self.language_lock:
             self.current_language = DEFAULT_LANGUAGE
-        self.say_blocking(LANGUAGES[self._get_active_language()]["reboot_ack"])
+        self.say_phrase_blocking("reboot_ack")
         self._run_profile_flow()
 
     def camera_worker(self) -> None:
