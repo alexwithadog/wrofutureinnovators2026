@@ -58,6 +58,7 @@ PIPER_DATA_DIR = os.path.expanduser("~/piper_voices")
 PIPER_LENGTH_SCALE = 1.00
 
 ACK_CACHE_DIR = os.path.expanduser("~/.atlas_ack_cache")
+PRECACHE_ALL_LANGUAGES = False
 
 EV3_MAC = "2C:6B:7D:7B:AE:02"
 YOLO_TO_SLOT = {
@@ -184,6 +185,19 @@ LANGUAGES: dict[str, dict] = {
 }
 
 DEFAULT_LANGUAGE = "english"
+
+CACHED_PHRASE_KEYS = [
+    ("second_try", "ack_second"),
+    ("failure", "failure"),
+    ("greeting", "greeting"),
+    ("ask_age", "ask_age"),
+    ("ask_profession", "ask_profession"),
+    ("ask_interest", "ask_interest"),
+    ("profile_thanks", "profile_thanks"),
+    ("reboot_ack", "reboot_ack"),
+    ("didnt_catch", "didnt_catch"),
+    ("exit_phrase", "exit_phrase"),
+]
 
 WAKE_WORDS = ("atlas", "helmet", "guide", "assistant")
 
@@ -534,6 +548,18 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                 self._currently_raised_slot = None
                 self.motor_follow_raised_object = None
 
+    def _motor_raise_all(self) -> None:
+        if not self.motor.connected:
+            return
+        with self._motor_lock:
+            if self._currently_raised_slot is None and self.motor_follow_raised_object is None:
+                return
+            print("[Motor] raise all")
+            ok = self.motor.raise_all()
+            if ok:
+                self._currently_raised_slot = None
+                self.motor_follow_raised_object = None
+
     def _motor_idle_watcher(self) -> None:
         while not self.stop_event.is_set():
             time.sleep(0.5)
@@ -552,25 +578,18 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                 continue
             idle_since = max(last_speak_end, last_activity)
             if (time.time() - idle_since) >= MOTOR_LOWER_DELAY_SECONDS:
-                self._motor_lower_all()
+                self._motor_raise_all()
 
     def _prepare_ack_wavs(self) -> None:
         print(f"[Piper] Checking local phrase cache at {ACK_CACHE_DIR} ...")
         rendered = 0
         cached = 0
-        phrase_keys = [
-            ("second_try", "ack_second"),
-            ("failure", "failure"),
-            ("greeting", "greeting"),
-            ("ask_age", "ask_age"),
-            ("ask_profession", "ask_profession"),
-            ("ask_interest", "ask_interest"),
-            ("profile_thanks", "profile_thanks"),
-            ("reboot_ack", "reboot_ack"),
-            ("didnt_catch", "didnt_catch"),
-            ("exit_phrase", "exit_phrase"),
-        ]
-        for lang_name, cfg in LANGUAGES.items():
+        if PRECACHE_ALL_LANGUAGES:
+            languages_to_prepare = list(LANGUAGES.keys())
+        else:
+            languages_to_prepare = [DEFAULT_LANGUAGE]
+        for lang_name in languages_to_prepare:
+            cfg = LANGUAGES[lang_name]
             voice = cfg["piper_voice"]
             self._ack_wavs[lang_name] = {"first_try": []}
             for i, phrase in enumerate(cfg["ack_first"]):
@@ -582,7 +601,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                         cached += 1
                     else:
                         rendered += 1
-            for kind, src_key in phrase_keys:
+            for kind, src_key in CACHED_PHRASE_KEYS:
                 path = os.path.join(ACK_CACHE_DIR, f"{kind}_{lang_name}.wav")
                 already = os.path.exists(path) and os.path.getsize(path) > 0
                 if _ensure_ack_wav(voice, cfg[src_key], path):
@@ -738,7 +757,14 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
     def say_phrase_blocking(self, phrase_key: str) -> None:
         lang = self._get_active_language()
         text = LANGUAGES[lang].get(phrase_key, "")
-        wav_path = self._ack_wavs.get(lang, {}).get(phrase_key)
+        lang_cache = self._ack_wavs.setdefault(lang, {"first_try": []})
+        wav_path = lang_cache.get(phrase_key)
+        if not wav_path and text:
+            voice = LANGUAGES[lang]["piper_voice"]
+            path = os.path.join(ACK_CACHE_DIR, f"{phrase_key}_{lang}.wav")
+            if _ensure_ack_wav(voice, text, path):
+                lang_cache[phrase_key] = path
+                wav_path = path
         print(f"[TTS] {text}")
         self.is_busy_event.set()
         self.speak_start_time = time.time()
@@ -1070,7 +1096,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                 finally:
                     self.is_busy_event.clear()
                     self.last_speak_end_time = time.time()
-            self._motor_lower_all()
+            self._motor_raise_all()
             self.stop_event.set()
             return
         for w in WAKE_WORDS:
@@ -1158,7 +1184,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         self._memory_clear()
         with self.profile_lock:
             self.visitor_profile = {}
-        self._motor_lower_all()
+        self._motor_raise_all()
         with self.language_lock:
             self.current_language = DEFAULT_LANGUAGE
         self.say_phrase_blocking("reboot_ack")
@@ -1312,9 +1338,9 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                 self.motor_follow_raised_object is not None
                 and (current_time - self.motor_follow_last_seen_time) >= OBJECT_LOST_LOWER_SECONDS
             ):
-                print("[Camera motor]: no centered artwork, lowering all")
+                print("[Camera motor]: no centered artwork, raising all")
                 self.motor_follow_raised_object = None
-                threading.Thread(target=self._motor_lower_all, daemon=True).start()
+                threading.Thread(target=self._motor_raise_all, daemon=True).start()
             return
 
         dominant = max(motor_candidates, key=lambda d: d.get("priority_score", d["confidence"]))
@@ -1387,7 +1413,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             self.stop_event.set()
             self._hard_stop_all_audio()
             try:
-                self._motor_lower_all()
+                self._motor_raise_all()
             except Exception:
                 pass
 
@@ -1400,7 +1426,7 @@ if __name__ == "__main__":
         helmet.stop_event.set()
         helmet._hard_stop_all_audio()
         try:
-            helmet._motor_lower_all()
+            helmet._motor_raise_all()
         except Exception:
             pass
         os.system("pkill -9 -f piper 2>/dev/null")

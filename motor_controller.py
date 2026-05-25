@@ -9,6 +9,7 @@ Usage:
     motor = MotorController(server_mac="2C:6B:7D:7B:AE:02")
     motor.connect_in_background()  # non-blocking
     motor.raise_picture("slot_1")  # safe even if not connected yet
+    motor.raise_all()
     motor.lower_all()
 """
 import threading
@@ -88,6 +89,10 @@ class MotorController:
     def lower_all(self) -> bool:
         """Lower all pictures. Returns True on success."""
         return self._send_command("lower_all")
+
+    def raise_all(self) -> bool:
+        """Raise all pictures. Returns True on success."""
+        return self._send_command("raise_all")
 
     def ping(self) -> bool:
         """Send a ping. Returns True if pong received."""
