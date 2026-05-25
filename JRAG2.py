@@ -65,6 +65,31 @@ YOLO_TO_SLOT = {
     "starry_night": "slot_2",
     "pharaoh_mask": "slot_3",
 }
+
+YOLO_CLASS_ALIASES = {
+    "mona_lisa": "mona_lisa",
+    "mona lisa": "mona_lisa",
+    "monalisa": "mona_lisa",
+    "starry_night": "starry_night",
+    "starry night": "starry_night",
+    "starrynight": "starry_night",
+    "pharaoh_mask": "pharaoh_mask",
+    "pharaoh mask": "pharaoh_mask",
+    "pharaohmask": "pharaoh_mask",
+    "tutankhamun": "pharaoh_mask",
+    "tutankhamun_mask": "pharaoh_mask",
+    "tutankhamun mask": "pharaoh_mask",
+    "mask_of_tutankhamun": "pharaoh_mask",
+    "mask of tutankhamun": "pharaoh_mask",
+    "objects": "pharaoh_mask",
+}
+
+ARTWORK_SPOKEN_NAMES = {
+    "mona_lisa": "Mona Lisa",
+    "starry_night": "The Starry Night",
+    "pharaoh_mask": "the Mask of Tutankhamun",
+}
+
 MOTOR_LOWER_DELAY_SECONDS = 5.0
 
 WHISPER_MODEL_SIZE = "tiny"
@@ -171,15 +196,16 @@ REBOOT_PHRASES = (
 
 MEMORY_TURNS = 10
 
-ENABLE_YOLO = False
-YOLO_WEIGHTS_PATH = "yolo26n.pt"
+ENABLE_YOLO = True
+YOLO_WEIGHTS_PATH = "best.pt"
 YOLO_IMGSZ = 480
 DETECT_EVERY_N_FRAMES = 2
 OBJECT_HOLD_SECONDS = 2.0
 OBJECT_COOLDOWN_SECONDS = 8.0
 TRIGGER_OBJECTS = set(YOLO_TO_SLOT.keys())
-DETECT_CONFIDENCE_THRESHOLD = 0.15
-TRIGGER_CONFIDENCE_THRESHOLD = 0.15
+DETECT_CONFIDENCE_THRESHOLD = 0.20
+TRIGGER_CONFIDENCE_THRESHOLD = 0.30
+CENTER_PRIORITY_WEIGHT = 0.40
 
 CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
@@ -222,6 +248,17 @@ def _strip_accents(text: str) -> str:
     text = (text or "").lower().strip()
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _normalize_yolo_class(raw_name: str) -> str | None:
+    name = _strip_accents(raw_name)
+    name = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+    spaced = name.replace("_", " ")
+    return YOLO_CLASS_ALIASES.get(name) or YOLO_CLASS_ALIASES.get(spaced)
+
+
+def _artwork_spoken_name(artwork_id: str) -> str:
+    return ARTWORK_SPOKEN_NAMES.get(artwork_id, artwork_id.replace("_", " "))
 
 
 def _is_reboot_phrase(text: str) -> bool:
@@ -740,6 +777,7 @@ About every other response, end with a short curious question back to the visito
     def _build_object_prompt(self, object_name: str) -> str:
         directive = self._get_active_gemini_directive()
         artwork_id = YOLO_TO_ARTWORK_ID.get(object_name)
+        spoken_name = _artwork_spoken_name(artwork_id or object_name)
         if artwork_id:
             rag_block = self._retrieve_rag_by_id(artwork_id)
         else:
@@ -756,10 +794,10 @@ Conversation so far (most recent last):
 {self._memory_as_transcript()}
 {rag_block}
 Camera event:
-The visitor has been steadily looking at an object detected as "{object_name}" for at least {OBJECT_HOLD_SECONDS} seconds.
+The visitor has been steadily looking at "{spoken_name}" for at least {OBJECT_HOLD_SECONDS} seconds.
 
 Task:
-Give a short, natural museum-guide explanation of "{object_name}".
+Give a short, natural museum-guide explanation of "{spoken_name}".
 Do NOT mention detection or observation; just speak as if you noticed it yourself.
 Keep it to 1-2 short sentences. If unsure, use soft uncertainty.
 This is NOT a bystander event, never reply SKIP for a camera event.
@@ -1070,13 +1108,34 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                         result = results[0]
                         last_annotated = result.plot(boxes=True, masks=False)
                         boxes = result.boxes
-                        if (boxes is not None and boxes.cls is not None and boxes.conf is not None):
-                            for cls_id, conf in zip(boxes.cls.tolist(), boxes.conf.tolist()):
+                        if (boxes is not None and boxes.cls is not None and boxes.conf is not None and boxes.xyxy is not None):
+                            frame_h, frame_w = frame.shape[:2]
+                            frame_cx = frame_w / 2.0
+                            frame_cy = frame_h / 2.0
+                            max_center_dist = ((frame_cx ** 2) + (frame_cy ** 2)) ** 0.5
+                            for cls_id, conf, xyxy in zip(boxes.cls.tolist(), boxes.conf.tolist(), boxes.xyxy.tolist()):
                                 if conf < DETECT_CONFIDENCE_THRESHOLD:
                                     continue
                                 cls_index = int(cls_id)
-                                name = result.names.get(cls_index, str(cls_index))
-                                detections.append({"name": str(name).lower(), "confidence": float(conf)})
+                                raw_name = str(result.names.get(cls_index, str(cls_index))).lower()
+                                canonical_name = _normalize_yolo_class(raw_name)
+                                if canonical_name is None:
+                                    continue
+                                x1, y1, x2, y2 = [float(v) for v in xyxy]
+                                box_cx = (x1 + x2) / 2.0
+                                box_cy = (y1 + y2) / 2.0
+                                center_dist = (((box_cx - frame_cx) ** 2) + ((box_cy - frame_cy) ** 2)) ** 0.5
+                                center_dist_norm = min(1.0, center_dist / max_center_dist) if max_center_dist else 1.0
+                                center_score = 1.0 - center_dist_norm
+                                priority_score = ((1.0 - CENTER_PRIORITY_WEIGHT) * float(conf)) + (CENTER_PRIORITY_WEIGHT * center_score)
+                                detections.append({
+                                    "name": canonical_name,
+                                    "raw_name": raw_name,
+                                    "confidence": float(conf),
+                                    "center_score": center_score,
+                                    "priority_score": priority_score,
+                                    "box_center": (box_cx, box_cy),
+                                })
                         inference_time = (time.time() - t0) * 1000.0
                         last_fps = 1000.0 / inference_time if inference_time > 0 else 0.0
                         self._maybe_trigger_object_explanation(detections)
@@ -1121,7 +1180,11 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             return
         current_time = time.time()
         if detections:
-            summary = ", ".join(f"{d['name']} ({d['confidence']:.2f})" for d in detections)
+            summary = ", ".join(
+                f"{d['name']} raw={d.get('raw_name', d['name'])} "
+                f"conf={d['confidence']:.2f} center={d.get('center_score', 0.0):.2f}"
+                for d in detections
+            )
             if summary != self.last_terminal_objects:
                 print(f"[Camera detected]: {summary}")
                 self.last_terminal_objects = summary
@@ -1137,11 +1200,12 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             return
         if not triggerable:
             return
-        dominant = max(triggerable, key=lambda d: d["confidence"])
+        dominant = max(triggerable, key=lambda d: d.get("priority_score", d["confidence"]))
         dominant_name = dominant["name"]
         if dominant_name != self.last_seen_object:
             self.last_seen_object = dominant_name
             self.object_first_seen_time = current_time
+            print(f"[Camera hold]: started {dominant_name}")
             return
         if self.object_first_seen_time is None:
             self.object_first_seen_time = current_time
@@ -1153,7 +1217,10 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             queue_empty = self.request_queue.empty()
             if not (off_cooldown and not busy and queue_empty):
                 return
-            print(f"[Camera trigger]: {dominant_name} (conf={dominant['confidence']:.2f})")
+            print(
+                f"[Camera trigger]: {dominant_name} "
+                f"(conf={dominant['confidence']:.2f}, center={dominant.get('center_score', 0.0):.2f})"
+            )
             self.last_object_trigger_time[dominant_name] = current_time
             threading.Thread(target=self._motor_raise, args=(dominant_name,), daemon=True).start()
             self.request_queue.put({"kind": "object", "text": dominant_name})
