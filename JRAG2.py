@@ -198,14 +198,28 @@ MEMORY_TURNS = 10
 
 ENABLE_YOLO = True
 YOLO_WEIGHTS_PATH = "best.pt"
-YOLO_IMGSZ = 480
-DETECT_EVERY_N_FRAMES = 2
+YOLO_IMGSZ = 416
+DETECT_EVERY_N_FRAMES = 1
 OBJECT_HOLD_SECONDS = 2.0
 OBJECT_COOLDOWN_SECONDS = 8.0
 TRIGGER_OBJECTS = set(YOLO_TO_SLOT.keys())
-DETECT_CONFIDENCE_THRESHOLD = 0.20
-TRIGGER_CONFIDENCE_THRESHOLD = 0.30
+DETECT_CONFIDENCE_THRESHOLD = 0.10
+MOTOR_CONFIDENCE_THRESHOLD = 0.14
+TRIGGER_CONFIDENCE_THRESHOLD = 0.24
+MOTOR_CONFIDENCE_BY_OBJECT = {
+    "mona_lisa": 0.12,
+    "starry_night": 0.12,
+    "pharaoh_mask": 0.16,
+}
+TRIGGER_CONFIDENCE_BY_OBJECT = {
+    "mona_lisa": 0.22,
+    "starry_night": 0.22,
+    "pharaoh_mask": 0.28,
+}
 CENTER_PRIORITY_WEIGHT = 0.40
+CENTER_ACTIVE_THRESHOLD = 0.38
+MOTOR_FOLLOW_HOLD_SECONDS = 0.12
+OBJECT_LOST_LOWER_SECONDS = 0.35
 
 CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
@@ -259,6 +273,10 @@ def _normalize_yolo_class(raw_name: str) -> str | None:
 
 def _artwork_spoken_name(artwork_id: str) -> str:
     return ARTWORK_SPOKEN_NAMES.get(artwork_id, artwork_id.replace("_", " "))
+
+
+def _object_threshold(thresholds: dict[str, float], object_name: str, default: float) -> float:
+    return thresholds.get(object_name, default)
 
 
 def _is_reboot_phrase(text: str) -> bool:
@@ -356,6 +374,10 @@ class MuseumHelmet:
         self.object_first_seen_time = None
         self.last_object_trigger_time: dict[str, float] = {name: 0.0 for name in YOLO_TO_SLOT.keys()}
         self.last_terminal_objects = None
+        self.motor_follow_candidate = None
+        self.motor_follow_first_seen_time = None
+        self.motor_follow_last_seen_time = 0.0
+        self.motor_follow_raised_object = None
 
         self.utterance_queue: queue.Queue = queue.Queue()
         self.request_queue: queue.Queue = queue.Queue()
@@ -460,6 +482,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             ok = self.motor.raise_picture(slot)
             if ok:
                 self._currently_raised_slot = slot
+                self.motor_follow_raised_object = yolo_class_name
                 self._last_motor_activity = time.time()
 
     def _motor_lower_all(self) -> None:
@@ -472,6 +495,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             ok = self.motor.lower_all()
             if ok:
                 self._currently_raised_slot = None
+                self.motor_follow_raised_object = None
 
     def _motor_idle_watcher(self) -> None:
         while not self.stop_event.is_set():
@@ -1192,16 +1216,53 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             if self.last_terminal_objects is not None:
                 print("[Camera detected]: none")
                 self.last_terminal_objects = None
-        triggerable = [d for d in detections if d["name"] in TRIGGER_OBJECTS and d["confidence"] >= TRIGGER_CONFIDENCE_THRESHOLD]
-        still_seeing = [d for d in detections if d["name"] in TRIGGER_OBJECTS and d["confidence"] >= DETECT_CONFIDENCE_THRESHOLD]
-        if not still_seeing:
+        motor_candidates = [
+            d for d in detections
+            if (
+                d["name"] in TRIGGER_OBJECTS
+                and d["confidence"] >= _object_threshold(MOTOR_CONFIDENCE_BY_OBJECT, d["name"], MOTOR_CONFIDENCE_THRESHOLD)
+                and d.get("center_score", 0.0) >= CENTER_ACTIVE_THRESHOLD
+            )
+        ]
+        speech_candidates = [
+            d for d in detections
+            if (
+                d["name"] in TRIGGER_OBJECTS
+                and d["confidence"] >= _object_threshold(TRIGGER_CONFIDENCE_BY_OBJECT, d["name"], TRIGGER_CONFIDENCE_THRESHOLD)
+                and d.get("center_score", 0.0) >= CENTER_ACTIVE_THRESHOLD
+            )
+        ]
+
+        if not motor_candidates:
             self.last_seen_object = None
             self.object_first_seen_time = None
+            self.motor_follow_candidate = None
+            self.motor_follow_first_seen_time = None
+            if (
+                self.motor_follow_raised_object is not None
+                and (current_time - self.motor_follow_last_seen_time) >= OBJECT_LOST_LOWER_SECONDS
+            ):
+                print("[Camera motor]: no centered artwork, lowering all")
+                self.motor_follow_raised_object = None
+                threading.Thread(target=self._motor_lower_all, daemon=True).start()
             return
-        if not triggerable:
-            return
-        dominant = max(triggerable, key=lambda d: d.get("priority_score", d["confidence"]))
+
+        dominant = max(motor_candidates, key=lambda d: d.get("priority_score", d["confidence"]))
         dominant_name = dominant["name"]
+        self.motor_follow_last_seen_time = current_time
+
+        if dominant_name != self.motor_follow_candidate:
+            self.motor_follow_candidate = dominant_name
+            self.motor_follow_first_seen_time = current_time
+        elif (
+            self.motor_follow_first_seen_time is not None
+            and (current_time - self.motor_follow_first_seen_time) >= MOTOR_FOLLOW_HOLD_SECONDS
+            and self.motor_follow_raised_object != dominant_name
+        ):
+            print(f"[Camera motor]: raise centered {dominant_name}")
+            self.motor_follow_raised_object = dominant_name
+            threading.Thread(target=self._motor_raise, args=(dominant_name,), daemon=True).start()
+
         if dominant_name != self.last_seen_object:
             self.last_seen_object = dominant_name
             self.object_first_seen_time = current_time
@@ -1213,6 +1274,9 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         held_long_enough = (current_time - self.object_first_seen_time) >= OBJECT_HOLD_SECONDS
         off_cooldown = (current_time - self.last_object_trigger_time.get(dominant_name, 0.0)) >= OBJECT_COOLDOWN_SECONDS
         if held_long_enough:
+            speech_ready = any(d["name"] == dominant_name for d in speech_candidates)
+            if not speech_ready:
+                return
             busy = self.is_busy_event.is_set()
             queue_empty = self.request_queue.empty()
             if not (off_cooldown and not busy and queue_empty):
