@@ -377,14 +377,32 @@ def _rms_energy(samples: np.ndarray) -> float:
     return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
 
 
+def _startup_ok(label: str, ok: bool, detail: str = "") -> None:
+    status = "OK" if ok else "WARN"
+    suffix = f" - {detail}" if detail else ""
+    print(f"[Startup] {status}: {label}{suffix}")
+
+
 class _RebootRequested(Exception):
     pass
 
 
 class MuseumHelmet:
     def __init__(self):
+        print("\n[Startup] ATLAS boot check")
+        print(f"[Startup] Working directory: {os.getcwd()}")
         load_dotenv()
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
+        _startup_ok("Gemini API key", bool(self.gemini_api_key), "set" if self.gemini_api_key else "missing GEMINI_API_KEY")
+        _startup_ok("YOLO weights", os.path.exists(YOLO_WEIGHTS_PATH), YOLO_WEIGHTS_PATH)
+        _startup_ok("Piper voice directory", os.path.isdir(PIPER_DATA_DIR), PIPER_DATA_DIR)
+        _startup_ok("Phrase cache directory", os.path.isdir(ACK_CACHE_DIR), ACK_CACHE_DIR)
+        _startup_ok("Artwork sheets directory", os.path.isdir(os.path.join("data", "artworks")), os.path.join("data", "artworks"))
+        print(
+            "[Startup] Config: "
+            f"camera={CAMERA_INDEX}, mic={MIC_DEVICE}, ev3={EV3_MAC}, "
+            f"yolo_imgsz={YOLO_IMGSZ}, detect_every={DETECT_EVERY_N_FRAMES}"
+        )
         if not self.gemini_api_key:
             raise RuntimeError("GEMINI_API_KEY not set. Put it in .env.")
         self.client = genai.Client(api_key=self.gemini_api_key)
@@ -1391,6 +1409,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         print("[Motor] Starting background connection to EV3 ...")
         self.motor.connect_in_background()
 
+        print("[Startup] Starting camera, microphone, transcription, Gemini, and motor idle threads...")
         camera_thread = threading.Thread(target=self.camera_worker, daemon=True)
         camera_thread.start()
         stt_thread = threading.Thread(target=self._listen_forever, daemon=True)
@@ -1402,6 +1421,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         motor_idle_thread = threading.Thread(target=self._motor_idle_watcher, daemon=True)
         motor_idle_thread.start()
 
+        print("[Startup] Threads started. Beginning visitor profile flow.")
         self._run_profile_flow()
 
         try:
