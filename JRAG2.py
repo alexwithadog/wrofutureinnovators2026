@@ -214,8 +214,8 @@ ENABLE_YOLO = True
 YOLO_WEIGHTS_PATH = "best.pt"
 YOLO_IMGSZ = 416
 DETECT_EVERY_N_FRAMES = 1
-OBJECT_HOLD_SECONDS = 2.0
-OBJECT_COOLDOWN_SECONDS = 8.0
+OBJECT_HOLD_SECONDS = 0.8
+OBJECT_COOLDOWN_SECONDS = 5.0
 TRIGGER_OBJECTS = set(YOLO_TO_SLOT.keys())
 DETECT_CONFIDENCE_THRESHOLD = 0.10
 MOTOR_CONFIDENCE_THRESHOLD = 0.14
@@ -244,6 +244,7 @@ CAMERA_PROCESS_SIZE = (1280, 720)
 
 GEMINI_MODEL_PRIMARY = "gemini-2.5-flash"
 GEMINI_MODEL_FALLBACK = "gemini-2.5-flash-lite"
+GEMINI_MODEL_CAMERA = GEMINI_MODEL_FALLBACK
 ACK_DELAY_SECONDS = 1.5
 
 RAG_SCORE_THRESHOLD = 0.25
@@ -804,7 +805,13 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                 chunks.append(delta)
         return "".join(chunks).strip()
 
-    def _gemini_request_with_retries(self, prompt: str, ack_enabled: bool) -> tuple[str, str]:
+    def _gemini_request_with_retries(
+        self,
+        prompt: str,
+        ack_enabled: bool,
+        primary_model: str = GEMINI_MODEL_PRIMARY,
+        fallback_model: str = GEMINI_MODEL_FALLBACK,
+    ) -> tuple[str, str]:
         result_holder: dict = {}
 
         def attempt(model, key):
@@ -813,7 +820,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             except Exception as e:
                 result_holder[key] = ("err", str(e))
 
-        t1 = threading.Thread(target=attempt, args=(GEMINI_MODEL_PRIMARY, "t1"), daemon=True)
+        t1 = threading.Thread(target=attempt, args=(primary_model, "t1"), daemon=True)
         t1.start()
         t1_start = time.time()
         ack_played = False
@@ -829,27 +836,28 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
         status, payload = result_holder.get("t1", ("err", "unknown"))
         if status == "ok" and payload:
             return (payload, "ok")
-        print(f"[Gemini] primary attempt 1 failed/empty: {payload[:120] if payload else '(empty)'}")
+        print(f"[Gemini] {primary_model} attempt 1 failed/empty: {payload[:120] if payload else '(empty)'}")
         if ack_enabled:
             second_wav = self._ack_wavs.get(self._get_active_language(), {}).get("second_try")
             if second_wav:
                 print("[ack] (sorry, one second)")
                 self._play_cached_wav(second_wav)
         try:
-            text = self._gemini_try_once(GEMINI_MODEL_PRIMARY, prompt)
+            text = self._gemini_try_once(primary_model, prompt)
             if text:
                 return (text, "ok")
-            print("[Gemini] primary attempt 2 returned empty.")
+            print(f"[Gemini] {primary_model} attempt 2 returned empty.")
         except Exception as e:
-            print(f"[Gemini] primary attempt 2 failed: {e}")
-        try:
-            print(f"[Gemini] falling back to {GEMINI_MODEL_FALLBACK}")
-            text = self._gemini_try_once(GEMINI_MODEL_FALLBACK, prompt)
-            if text:
-                return (text, "ok")
-            print("[Gemini] fallback returned empty.")
-        except Exception as e:
-            print(f"[Gemini] fallback failed: {e}")
+            print(f"[Gemini] {primary_model} attempt 2 failed: {e}")
+        if fallback_model != primary_model:
+            try:
+                print(f"[Gemini] falling back to {fallback_model}")
+                text = self._gemini_try_once(fallback_model, prompt)
+                if text:
+                    return (text, "ok")
+                print("[Gemini] fallback returned empty.")
+            except Exception as e:
+                print(f"[Gemini] fallback failed: {e}")
         return ("", "failed")
 
     def _retrieve_rag_context(self, query: str) -> str:
@@ -916,15 +924,13 @@ About every other response, end with a short curious question back to the visito
         else:
             rag_block = self._retrieve_rag_context(object_name)
         profile_block = self._profile_block()
-        return f"""{self.system_prompt}
+        return f"""You are Atlas, a warm museum guide speaking aloud to a visitor.
 
 LANGUAGE INSTRUCTION: {directive}
 
 {self.formatting_rules}
 
 {profile_block}
-Conversation so far (most recent last):
-{self._memory_as_transcript()}
 {rag_block}
 Camera event:
 The visitor has been steadily looking at "{spoken_name}" for at least {OBJECT_HOLD_SECONDS} seconds.
@@ -932,29 +938,35 @@ The visitor has been steadily looking at "{spoken_name}" for at least {OBJECT_HO
 Task:
 Give a short, natural museum-guide explanation of "{spoken_name}".
 Do NOT mention detection or observation; just speak as if you noticed it yourself.
-Keep it to 1-2 short sentences. If unsure, use soft uncertainty.
-This is NOT a bystander event, never reply SKIP for a camera event.
+Keep it to 1 short sentence, or 2 very short sentences at most.
+Use the museum sheet as ground truth if present.
 {directive}
 """
 
-    def _handle_request(self, kind: str, text: str) -> None:
+    def _handle_request(self, kind: str, text: str, created_at: float | None = None) -> None:
+        if created_at is not None:
+            print(f"[Timing] {kind} queue wait: {time.time() - created_at:.2f}s")
         if kind == "user":
             prompt = self._build_user_prompt(text)
             self._memory_append("user", text)
             ack_enabled = True
+            primary_model = GEMINI_MODEL_PRIMARY
         elif kind == "object":
             prompt = self._build_object_prompt(text)
             self._memory_append("camera", text)
             ack_enabled = False
+            primary_model = GEMINI_MODEL_CAMERA
         else:
             return
-        print("[Gemini] thinking ...")
+        print(f"[Gemini] thinking with {primary_model} ...")
         self.is_busy_event.set()
+        gemini_start = time.time()
         try:
-            response, status = self._gemini_request_with_retries(prompt, ack_enabled)
+            response, status = self._gemini_request_with_retries(prompt, ack_enabled, primary_model=primary_model)
         except Exception as e:
             print(f"[Gemini] unexpected error: {e}")
             response, status = "", "failed"
+        print(f"[Timing] {kind} Gemini: {time.time() - gemini_start:.2f}s")
         if status == "failed":
             failure_wav = self._ack_wavs.get(self._get_active_language(), {}).get("failure")
             if failure_wav:
@@ -983,11 +995,13 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         sanitized = self._sanitize_for_tts(response)
         print(f"[TTS] {sanitized}")
         self.speak_start_time = time.time()
+        tts_start = time.time()
         try:
             self._speak_full(sanitized)
         finally:
             self.is_busy_event.clear()
             self.last_speak_end_time = time.time()
+            print(f"[Timing] {kind} TTS/playback: {time.time() - tts_start:.2f}s")
         self._memory_append("assistant", sanitized)
 
     def _gemini_worker(self) -> None:
@@ -996,7 +1010,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                 req = self.request_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
-            self._handle_request(req.get("kind"), req.get("text", ""))
+            self._handle_request(req.get("kind"), req.get("text", ""), req.get("created_at"))
 
     def _listen_forever(self) -> None:
         if MIC_NATIVE_RATE % MIC_SAMPLE_RATE != 0:
@@ -1123,7 +1137,7 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                 break
         if not text:
             return
-        self.request_queue.put({"kind": "user", "text": text})
+        self.request_queue.put({"kind": "user", "text": text, "created_at": time.time()})
 
     def _wait_for_profile_utterance(self, timeout_seconds: float = PROFILE_LISTEN_TIMEOUT_SECONDS) -> np.ndarray | None:
         try:
@@ -1397,11 +1411,12 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                 return
             print(
                 f"[Camera trigger]: {dominant_name} "
-                f"(conf={dominant['confidence']:.2f}, center={dominant.get('center_score', 0.0):.2f})"
+                f"(hold={current_time - self.object_first_seen_time:.2f}s, "
+                f"conf={dominant['confidence']:.2f}, center={dominant.get('center_score', 0.0):.2f})"
             )
             self.last_object_trigger_time[dominant_name] = current_time
             threading.Thread(target=self._motor_raise, args=(dominant_name,), daemon=True).start()
-            self.request_queue.put({"kind": "object", "text": dominant_name})
+            self.request_queue.put({"kind": "object", "text": dominant_name, "created_at": current_time})
             self.object_first_seen_time = current_time
 
     def start(self) -> None:
