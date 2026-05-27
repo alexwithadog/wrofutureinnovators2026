@@ -1,4 +1,3 @@
-# ============ BEGIN JRAG1.py ============
 """
 ATLAS - Museum Helmet (JRAG1)
 ==============================
@@ -18,17 +17,6 @@ Changes from JET8:
   7. Gemini system prompt now tells it to occasionally end a
      response with a short curious question back to the visitor,
      making the conversation feel two-way.
-
-Changes from previous JRAG1:
-  8. NEW MOTOR BEHAVIOR: at rest, all stands stay raised. When ATLAS
-     commits to explaining one artwork, the OTHER two stands lower so
-     the chosen one stands out. After speech finishes plus a delay,
-     all stands raise back to the at-rest state.
-     The old "follow the centered object" behavior has been removed.
-  9. MOTOR_LOWER_DELAY_SECONDS bumped from 5.0 to 12.0 so stands stay
-     in their committed state longer between turns.
- 10. pharaoh_mask confidence thresholds bumped (motor 0.16 -> 0.25,
-     trigger 0.28 -> 0.40) so the mask doesn't fire as easily.
 """
 
 import json
@@ -103,9 +91,7 @@ ARTWORK_SPOKEN_NAMES = {
     "pharaoh_mask": "the Mask of Tutankhamun",
 }
 
-# After ATLAS finishes speaking, wait this long before raising all stands
-# back to the at-rest "all up" state.
-MOTOR_LOWER_DELAY_SECONDS = 12.0
+MOTOR_LOWER_DELAY_SECONDS = 5.0
 
 WHISPER_MODEL_SIZE = "tiny"
 WHISPER_DEVICE = "cpu"
@@ -232,24 +218,22 @@ OBJECT_HOLD_SECONDS = 2.0
 OBJECT_COOLDOWN_SECONDS = 8.0
 TRIGGER_OBJECTS = set(YOLO_TO_SLOT.keys())
 DETECT_CONFIDENCE_THRESHOLD = 0.10
-
-# Per-class confidence thresholds.
-# The mask thresholds are higher because in testing it was firing too
-# easily compared to the paintings.
 MOTOR_CONFIDENCE_THRESHOLD = 0.14
 TRIGGER_CONFIDENCE_THRESHOLD = 0.24
 MOTOR_CONFIDENCE_BY_OBJECT = {
     "mona_lisa": 0.12,
     "starry_night": 0.12,
-    "pharaoh_mask": 0.25,
+    "pharaoh_mask": 0.16,
 }
 TRIGGER_CONFIDENCE_BY_OBJECT = {
     "mona_lisa": 0.22,
     "starry_night": 0.22,
-    "pharaoh_mask": 0.40,
+    "pharaoh_mask": 0.28,
 }
 CENTER_PRIORITY_WEIGHT = 0.40
 CENTER_ACTIVE_THRESHOLD = 0.38
+MOTOR_FOLLOW_HOLD_SECONDS = 0.12
+OBJECT_LOST_LOWER_SECONDS = 0.35
 
 CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
@@ -334,7 +318,7 @@ def _parse_age(text: str) -> int | None:
         "diez": 10, "once": 11, "doce": 12, "trece": 13,
         "catorce": 14, "quince": 15, "dieciseis": 16, "diecisiete": 17,
         "dieciocho": 18, "diecinueve": 19, "veinte": 20,
-        "due": 2, "tre": 3, "quattro": 4, "cinque": 5,
+        "uno": 1, "due": 2, "tre": 3, "quattro": 4, "cinque": 5,
         "sei": 6, "sette": 7, "otto": 8, "nove": 9, "dieci": 10,
         "undici": 11, "dodici": 12, "tredici": 13, "quattordici": 14,
         "quindici": 15, "sedici": 16, "diciassette": 17,
@@ -455,14 +439,14 @@ class MuseumHelmet:
                 print(f"[YOLO] Failed to load: {e}. Continuing without detection.")
                 self.yolo_model = None
 
-        # Object-hold tracking
         self.last_seen_object = None
         self.object_first_seen_time = None
         self.last_object_trigger_time: dict[str, float] = {name: 0.0 for name in YOLO_TO_SLOT.keys()}
         self.last_terminal_objects = None
-        # In the "lower others" model, this tracks which artwork is currently
-        # being explained (the one whose stand is kept raised).
-        self.committed_artwork: str | None = None
+        self.motor_follow_candidate = None
+        self.motor_follow_first_seen_time = None
+        self.motor_follow_last_seen_time = 0.0
+        self.motor_follow_raised_object = None
 
         self.utterance_queue: queue.Queue = queue.Queue()
         self.request_queue: queue.Queue = queue.Queue()
@@ -489,9 +473,7 @@ class MuseumHelmet:
         os.makedirs(ACK_CACHE_DIR, exist_ok=True)
 
         self.motor = MotorController(server_mac=EV3_MAC)
-        # Tracks which slot is the "highlighted" one (only one still raised
-        # while the others are lowered). None = at-rest: all stands raised.
-        self._currently_highlighted_slot: str | None = None
+        self._currently_raised_slot: str | None = None
         self._motor_lock = threading.Lock()
         self._last_motor_activity = 0.0
 
@@ -558,37 +540,43 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
 - Write ONLY plain spoken prose, continuous sentences, like a person talking.
 """
 
-    # =========================================================================
-    # MOTOR HELPERS
-    # =========================================================================
-
-    def _motor_lower_others(self, keep_class_name: str) -> None:
-        """Lower every stand EXCEPT the one for the named artwork."""
+    def _motor_raise(self, yolo_class_name: str) -> None:
+        slot = YOLO_TO_SLOT.get(yolo_class_name)
+        if slot is None:
+            return
         if not self.motor.connected:
             return
-        keep_slot = YOLO_TO_SLOT.get(keep_class_name)
-        if keep_slot is None:
-            return
         with self._motor_lock:
-            print(f"[Motor] lower others, keep {keep_class_name!r} -> {keep_slot}")
-            ok = self.motor.lower_others(keep_slot)
+            print(f"[Motor] raise {yolo_class_name!r} -> {slot}")
+            ok = self.motor.raise_picture(slot)
             if ok:
-                self._currently_highlighted_slot = keep_slot
-                self.committed_artwork = keep_class_name
+                self._currently_raised_slot = slot
+                self.motor_follow_raised_object = yolo_class_name
                 self._last_motor_activity = time.time()
 
-    def _motor_raise_all(self) -> None:
-        """Return to at-rest state: all three stands raised."""
+    def _motor_lower_all(self) -> None:
         if not self.motor.connected:
             return
         with self._motor_lock:
-            if self._currently_highlighted_slot is None and self.committed_artwork is None:
+            if self._currently_raised_slot is None:
                 return
-            print("[Motor] raise all (back to at-rest)")
+            print("[Motor] lower all")
+            ok = self.motor.lower_all()
+            if ok:
+                self._currently_raised_slot = None
+                self.motor_follow_raised_object = None
+
+    def _motor_raise_all(self) -> None:
+        if not self.motor.connected:
+            return
+        with self._motor_lock:
+            if self._currently_raised_slot is None and self.motor_follow_raised_object is None:
+                return
+            print("[Motor] raise all")
             ok = self.motor.raise_all()
             if ok:
-                self._currently_highlighted_slot = None
-                self.committed_artwork = None
+                self._currently_raised_slot = None
+                self.motor_follow_raised_object = None
 
     def _motor_idle_watcher(self) -> None:
         while not self.stop_event.is_set():
@@ -596,23 +584,19 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             if self.stop_event.is_set():
                 break
             with self._motor_lock:
-                highlighted = self._currently_highlighted_slot
+                raised = self._currently_raised_slot
                 last_activity = self._last_motor_activity
                 last_speak_end = self.last_speak_end_time
                 busy = self.is_busy_event.is_set()
             if busy:
                 continue
-            if highlighted is None:
+            if raised is None:
                 continue
             if last_speak_end <= 0:
                 continue
             idle_since = max(last_speak_end, last_activity)
             if (time.time() - idle_since) >= MOTOR_LOWER_DELAY_SECONDS:
                 self._motor_raise_all()
-
-    # =========================================================================
-    # TTS / PIPER
-    # =========================================================================
 
     def _prepare_ack_wavs(self) -> None:
         print(f"[Piper] Checking local phrase cache at {ACK_CACHE_DIR} ...")
@@ -661,10 +645,6 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             with self._proc_lock:
                 self._aplay_proc = None
 
-    # =========================================================================
-    # MEMORY / PROFILE
-    # =========================================================================
-
     def _memory_append(self, role: str, text: str) -> None:
         with self.memory_lock:
             self.memory.append((role, text))
@@ -699,10 +679,6 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             "[End of profile]\n"
         )
 
-    # =========================================================================
-    # LANGUAGE
-    # =========================================================================
-
     def _get_active_language(self) -> str:
         with self.language_lock:
             return self.current_language
@@ -728,10 +704,6 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             if phrase in text:
                 return True
         return False
-
-    # =========================================================================
-    # TTS PLAYBACK
-    # =========================================================================
 
     def _sanitize_for_tts(self, text: str) -> str:
         if not text:
@@ -823,10 +795,6 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             self.is_busy_event.clear()
             self.last_speak_end_time = time.time()
 
-    # =========================================================================
-    # GEMINI
-    # =========================================================================
-
     def _gemini_try_once(self, model: str, prompt: str) -> str:
         chunks: list[str] = []
         stream = self.client.models.generate_content_stream(model=model, contents=prompt)
@@ -883,10 +851,6 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
         except Exception as e:
             print(f"[Gemini] fallback failed: {e}")
         return ("", "failed")
-
-    # =========================================================================
-    # RAG
-    # =========================================================================
 
     def _retrieve_rag_context(self, query: str) -> str:
         results = self.rag.search(query, n=RAG_TOP_K)
@@ -973,10 +937,6 @@ This is NOT a bystander event, never reply SKIP for a camera event.
 {directive}
 """
 
-    # =========================================================================
-    # REQUEST HANDLING
-    # =========================================================================
-
     def _handle_request(self, kind: str, text: str) -> None:
         if kind == "user":
             prompt = self._build_user_prompt(text)
@@ -1037,10 +997,6 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             except queue.Empty:
                 continue
             self._handle_request(req.get("kind"), req.get("text", ""))
-
-    # =========================================================================
-    # MIC / STT
-    # =========================================================================
 
     def _listen_forever(self) -> None:
         if MIC_NATIVE_RATE % MIC_SAMPLE_RATE != 0:
@@ -1169,10 +1125,6 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             return
         self.request_queue.put({"kind": "user", "text": text})
 
-    # =========================================================================
-    # PROFILE FLOW
-    # =========================================================================
-
     def _wait_for_profile_utterance(self, timeout_seconds: float = PROFILE_LISTEN_TIMEOUT_SECONDS) -> np.ndarray | None:
         try:
             item = self.profile_inbox.get(timeout=timeout_seconds)
@@ -1256,10 +1208,6 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         self.say_phrase_blocking("reboot_ack")
         self._run_profile_flow()
 
-    # =========================================================================
-    # CAMERA / YOLO
-    # =========================================================================
-
     def camera_worker(self) -> None:
         cap = None
         try:
@@ -1335,16 +1283,12 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                     display = last_annotated if last_annotated is not None else frame.copy()
                     lang_label = f"Lang: {self._get_active_language()}"
                     fps_label = f"YOLO FPS: {last_fps:.1f}" if ENABLE_YOLO else "YOLO: OFF"
-                    highlight_label = (
-                        f"Highlighted: {self._currently_highlighted_slot}"
-                        if self._currently_highlighted_slot
-                        else "At rest: all raised"
-                    )
+                    motor_label = f"Raised: {self._currently_raised_slot}" if self._currently_raised_slot else "Raised: -"
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     cv2.putText(display, lang_label, (10, 30), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
                     ts = cv2.getTextSize(fps_label, font, 0.8, 2)[0]
                     cv2.putText(display, fps_label, (display.shape[1] - ts[0] - 10, 30), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(display, highlight_label, (10, 60), font, 0.6, (200, 200, 255), 2, cv2.LINE_AA)
+                    cv2.putText(display, motor_label, (10, 60), font, 0.6, (200, 200, 255), 2, cv2.LINE_AA)
                     try:
                         cv2.imshow("ATLAS Museum Helmet", display)
                         if cv2.waitKey(1) == ord("q"):
@@ -1368,19 +1312,11 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                 pass
 
     def _maybe_trigger_object_explanation(self, detections: list[dict]) -> None:
-        """
-        Motors do NOT move just because the camera sees something. Motors only
-        move when ATLAS commits to an explanation. The commit lowers the OTHER
-        two stands so the named artwork stands out. After speech finishes plus
-        MOTOR_LOWER_DELAY_SECONDS of silence, the idle watcher raises everything
-        back to the at-rest state.
-        """
         if not ENABLE_YOLO:
             return
         if self.in_profile_flow.is_set():
             return
         current_time = time.time()
-
         if detections:
             summary = ", ".join(
                 f"{d['name']} raw={d.get('raw_name', d['name'])} "
@@ -1394,7 +1330,6 @@ This is NOT a bystander event, never reply SKIP for a camera event.
             if self.last_terminal_objects is not None:
                 print("[Camera detected]: none")
                 self.last_terminal_objects = None
-
         motor_candidates = [
             d for d in detections
             if (
@@ -1415,10 +1350,32 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         if not motor_candidates:
             self.last_seen_object = None
             self.object_first_seen_time = None
+            self.motor_follow_candidate = None
+            self.motor_follow_first_seen_time = None
+            if (
+                self.motor_follow_raised_object is not None
+                and (current_time - self.motor_follow_last_seen_time) >= OBJECT_LOST_LOWER_SECONDS
+            ):
+                print("[Camera motor]: no centered artwork, raising all")
+                self.motor_follow_raised_object = None
+                threading.Thread(target=self._motor_raise_all, daemon=True).start()
             return
 
         dominant = max(motor_candidates, key=lambda d: d.get("priority_score", d["confidence"]))
         dominant_name = dominant["name"]
+        self.motor_follow_last_seen_time = current_time
+
+        if dominant_name != self.motor_follow_candidate:
+            self.motor_follow_candidate = dominant_name
+            self.motor_follow_first_seen_time = current_time
+        elif (
+            self.motor_follow_first_seen_time is not None
+            and (current_time - self.motor_follow_first_seen_time) >= MOTOR_FOLLOW_HOLD_SECONDS
+            and self.motor_follow_raised_object != dominant_name
+        ):
+            print(f"[Camera motor]: raise centered {dominant_name}")
+            self.motor_follow_raised_object = dominant_name
+            threading.Thread(target=self._motor_raise, args=(dominant_name,), daemon=True).start()
 
         if dominant_name != self.last_seen_object:
             self.last_seen_object = dominant_name
@@ -1428,10 +1385,8 @@ This is NOT a bystander event, never reply SKIP for a camera event.
         if self.object_first_seen_time is None:
             self.object_first_seen_time = current_time
             return
-
         held_long_enough = (current_time - self.object_first_seen_time) >= OBJECT_HOLD_SECONDS
         off_cooldown = (current_time - self.last_object_trigger_time.get(dominant_name, 0.0)) >= OBJECT_COOLDOWN_SECONDS
-
         if held_long_enough:
             speech_ready = any(d["name"] == dominant_name for d in speech_candidates)
             if not speech_ready:
@@ -1445,22 +1400,14 @@ This is NOT a bystander event, never reply SKIP for a camera event.
                 f"(conf={dominant['confidence']:.2f}, center={dominant.get('center_score', 0.0):.2f})"
             )
             self.last_object_trigger_time[dominant_name] = current_time
-            # Lower the OTHER two stands so this artwork stands out.
-            # All raise back to at-rest after the idle delay following speech.
-            threading.Thread(target=self._motor_lower_others, args=(dominant_name,), daemon=True).start()
+            threading.Thread(target=self._motor_raise, args=(dominant_name,), daemon=True).start()
             self.request_queue.put({"kind": "object", "text": dominant_name})
             self.object_first_seen_time = current_time
-
-    # =========================================================================
-    # MAIN ENTRYPOINT
-    # =========================================================================
 
     def start(self) -> None:
         self._prepare_ack_wavs()
         print("[Motor] Starting background connection to EV3 ...")
         self.motor.connect_in_background()
-        # Motors are NOT touched at startup. Stands are assumed to already
-        # be in the at-rest "all raised" state when the program begins.
 
         print("[Startup] Starting camera, microphone, transcription, Gemini, and motor idle threads...")
         camera_thread = threading.Thread(target=self.camera_worker, daemon=True)
@@ -1510,4 +1457,3 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _emergency_shutdown)
 
     helmet.start()
-# ============ END JRAG1.py ============
