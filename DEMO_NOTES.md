@@ -72,8 +72,8 @@ During testing, watch lines like:
 
 ```text
 [Camera detected]: mona_lisa raw=monalisa conf=0.18 center=0.71
-[Camera motor]: raise centered mona_lisa
-[Camera trigger]: mona_lisa (hold=0.82s, conf=0.28, center=0.74)
+[Camera hold]: started mona_lisa
+[Camera trigger]: mona_lisa (hold=2.52s, conf=0.28, center=0.74)
 [Timing] object queue wait: 0.01s
 [Timing] object Gemini: 1.42s
 [Timing] object TTS/playback: 2.10s
@@ -90,7 +90,6 @@ Mask:
 Tune these in `JRAG2.py` only after seeing real logs:
 
 ```python
-MOTOR_CONFIDENCE_BY_OBJECT
 TRIGGER_CONFIDENCE_BY_OBJECT
 CENTER_ACTIVE_THRESHOLD
 OBJECT_HOLD_SECONDS
