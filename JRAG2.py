@@ -208,6 +208,10 @@ REBOOT_PHRASES = (
     "nuovo visitatore", "ricomincia", "riavvia",
 )
 
+PROFILE_SKIP_PHRASES = (
+    "skip", "skip profile", "skip setup", "skip questions", "test mode",
+)
+
 MEMORY_TURNS = 10
 
 ENABLE_YOLO = True
@@ -331,6 +335,14 @@ def _is_reboot_phrase(text: str) -> bool:
     return False
 
 
+def _is_profile_skip_phrase(text: str) -> bool:
+    norm = _strip_accents(text)
+    for phrase in PROFILE_SKIP_PHRASES:
+        if re.search(r"\b" + re.escape(_strip_accents(phrase)) + r"\b", norm):
+            return True
+    return False
+
+
 def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
     try:
         subprocess.run(
@@ -377,6 +389,10 @@ def _startup_ok(label: str, ok: bool, detail: str = "") -> None:
 
 
 class _RebootRequested(Exception):
+    pass
+
+
+class _ProfileSkipRequested(Exception):
     pass
 
 
@@ -1151,6 +1167,8 @@ Use the museum sheet as ground truth if present.
                 return None
             if _is_reboot_phrase(text):
                 raise _RebootRequested()
+            if _is_profile_skip_phrase(text):
+                raise _ProfileSkipRequested()
             lang_key = WHISPER_LANG_TO_KEY.get(lang_code, DEFAULT_LANGUAGE)
             self._set_active_language(lang_key)
             print(f"[Profile heard] ({lang_code}): {text}")
@@ -1177,6 +1195,11 @@ Use the museum sheet as ground truth if present.
             with self.profile_lock:
                 self.visitor_profile = new_profile
             print(f"[Profile] Collected: {new_profile}")
+            self.say_phrase_blocking("profile_thanks")
+        except _ProfileSkipRequested:
+            with self.profile_lock:
+                self.visitor_profile = dict(PROFILE_DEFAULT)
+            print(f"[Profile] Skipped by voice command. Using defaults: {PROFILE_DEFAULT}")
             self.say_phrase_blocking("profile_thanks")
         except _RebootRequested:
             print("[Profile] Reboot during profile flow, restarting.")
