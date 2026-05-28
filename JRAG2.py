@@ -416,10 +416,6 @@ class MuseumHelmet:
             raise RuntimeError("GEMINI_API_KEY not set. Put it in .env.")
         self.client = genai.Client(api_key=self.gemini_api_key)
 
-        print("[RAG] Loading sheets and embedding model...")
-        self.rag = RAG()
-        print(f"[RAG] Collection size: {self.rag.collection.count()} sheet(s)")
-
         print(f"[STT] Loading Whisper '{WHISPER_MODEL_SIZE}' on {WHISPER_DEVICE} ({WHISPER_COMPUTE})...")
         self.whisper = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
         print("[STT] Whisper ready.")
@@ -433,20 +429,16 @@ class MuseumHelmet:
         else:
             print("[Display] No display detected, running headless.")
 
+        self.rag = None
+        self.rag_lock = threading.Lock()
+        self.rag_ready = threading.Event()
+        self.rag_failed = False
+
         self.yolo_model = None
-        if ENABLE_YOLO:
-            try:
-                from ultralytics import YOLO
-                print(f"[YOLO] Loading {YOLO_WEIGHTS_PATH}...")
-                self.yolo_model = YOLO(YOLO_WEIGHTS_PATH)
-                try:
-                    self.yolo_model.to("cuda")
-                    print("[YOLO] Loaded on CUDA.")
-                except Exception as e:
-                    print(f"[YOLO] WARNING: could not move to CUDA: {e}")
-            except Exception as e:
-                print(f"[YOLO] Failed to load: {e}. Continuing without detection.")
-                self.yolo_model = None
+        self.yolo_device = "cuda"
+        self.yolo_lock = threading.Lock()
+        self.yolo_ready = threading.Event()
+        self.yolo_failed = False
 
         self.last_seen_object = None
         self.object_first_seen_time = None
@@ -588,6 +580,55 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             idle_since = max(last_speak_end, last_activity)
             if (time.time() - idle_since) >= MOTOR_LOWER_DELAY_SECONDS:
                 self._motor_raise_all()
+
+    def _load_rag(self):
+        with self.rag_lock:
+            if self.rag is not None:
+                return self.rag
+            if self.rag_failed:
+                return None
+            try:
+                print("[RAG] Loading sheets and embedding model...")
+                self.rag = RAG()
+                print(f"[RAG] Collection size: {self.rag.collection.count()} sheet(s)")
+            except Exception as e:
+                self.rag_failed = True
+                print(f"[RAG] Failed to load: {e}. Continuing without museum sheets.")
+            finally:
+                self.rag_ready.set()
+            return self.rag
+
+    def _start_rag_background(self) -> None:
+        threading.Thread(target=self._load_rag, daemon=True).start()
+
+    def _load_yolo(self) -> None:
+        if not ENABLE_YOLO:
+            self.yolo_ready.set()
+            return
+        with self.yolo_lock:
+            if self.yolo_model is not None or self.yolo_failed:
+                return
+            try:
+                from ultralytics import YOLO
+                print(f"[YOLO] Loading {YOLO_WEIGHTS_PATH}...")
+                model = YOLO(YOLO_WEIGHTS_PATH)
+                try:
+                    model.to("cuda")
+                    self.yolo_device = "cuda"
+                    print("[YOLO] Loaded on CUDA.")
+                except Exception as e:
+                    self.yolo_device = "cpu"
+                    print(f"[YOLO] WARNING: could not move to CUDA: {e}")
+                    print("[YOLO] Using CPU for detection.")
+                self.yolo_model = model
+            except Exception as e:
+                self.yolo_failed = True
+                print(f"[YOLO] Failed to load: {e}. Continuing without detection.")
+            finally:
+                self.yolo_ready.set()
+
+    def _start_yolo_background(self) -> None:
+        threading.Thread(target=self._load_yolo, daemon=True).start()
 
     def _prepare_ack_wavs(self) -> None:
         print(f"[Piper] Checking local phrase cache at {ACK_CACHE_DIR} ...")
@@ -851,7 +892,10 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
         return ("", "failed")
 
     def _retrieve_rag_context(self, query: str) -> str:
-        results = self.rag.search(query, n=RAG_TOP_K)
+        rag = self._load_rag()
+        if rag is None:
+            return ""
+        results = rag.search(query, n=RAG_TOP_K)
         if not results:
             return ""
         top = results[0]
@@ -864,7 +908,10 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                 "[End of museum sheet]\n")
 
     def _retrieve_rag_by_id(self, artwork_id: str) -> str:
-        sheet = self.rag.sheet_by_id(artwork_id)
+        rag = self._load_rag()
+        if rag is None:
+            return ""
+        sheet = rag.sheet_by_id(artwork_id)
         if sheet is None:
             return ""
         print(f"[RAG] Injecting {artwork_id} (direct lookup)")
@@ -1259,7 +1306,7 @@ Use the museum sheet as ground truth if present.
                 if (ENABLE_YOLO and self.yolo_model is not None and frame_idx % DETECT_EVERY_N_FRAMES == 0):
                     try:
                         t0 = time.time()
-                        results = self.yolo_model.predict(frame, imgsz=YOLO_IMGSZ, verbose=False, device="cuda")
+                        results = self.yolo_model.predict(frame, imgsz=YOLO_IMGSZ, verbose=False, device=self.yolo_device)
                         result = results[0]
                         last_annotated = result.plot(boxes=True, masks=False)
                         boxes = result.boxes
@@ -1391,6 +1438,8 @@ Use the museum sheet as ground truth if present.
 
     def start(self) -> None:
         self._prepare_ack_wavs()
+        self._start_rag_background()
+        self._start_yolo_background()
         print("[Motor] Starting background connection to EV3 ...")
         self.motor.connect_in_background()
 
