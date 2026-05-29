@@ -50,12 +50,12 @@ MIC_DEVICE = 1
 MIC_CHANNELS = 2
 MIC_SAMPLE_RATE = 16000
 MIC_NATIVE_RATE = 48000
-MIC_BLOCKSIZE = 4800
+MIC_BLOCKSIZE = 2400
 
 AUDIO_OUT_DEVICE: str | None = "plughw:0,0"
 
 PIPER_DATA_DIR = os.path.expanduser("~/piper_voices")
-PIPER_LENGTH_SCALE = 1.00
+PIPER_LENGTH_SCALE = 0.92
 
 ACK_CACHE_DIR = os.path.expanduser("~/.atlas_ack_cache")
 PRECACHE_ALL_LANGUAGES = False
@@ -96,6 +96,7 @@ MOTOR_LOWER_DELAY_SECONDS = 5.0
 WHISPER_MODEL_SIZE = "tiny"
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE = "int8"
+WHISPER_BEAM_SIZE = 1
 WHISPER_ALLOWED_LANGS = {"en", "fr", "es", "it"}
 DEFAULT_LANG_CODE = "en"
 
@@ -107,11 +108,11 @@ WHISPER_LANG_TO_KEY = {
 }
 
 VAD_ENERGY_THRESHOLD = 500
-VAD_SILENCE_DURATION = 0.8
+VAD_SILENCE_DURATION = 0.45
 VAD_MIN_UTTERANCE_DURATION = 0.5
 VAD_MAX_UTTERANCE_DURATION = 15.0
 
-POST_SPEAK_SETTLE_SECONDS = 0.60
+POST_SPEAK_SETTLE_SECONDS = 0.35
 
 LANGUAGES: dict[str, dict] = {
     "english": {
@@ -1092,14 +1093,14 @@ Use the museum sheet as ground truth if present.
                     is_speaking = False
                     if duration >= VAD_MIN_UTTERANCE_DURATION:
                         utterance = np.concatenate(audio_buffer)
-                        self.utterance_queue.put({"audio": utterance, "duration": duration})
+                        self.utterance_queue.put({"audio": utterance, "duration": duration, "created_at": time.time()})
                     audio_buffer.clear()
                     utt_start_time = None
                     last_voice_time = None
                 elif (utt_start_time is not None and (now - utt_start_time) >= VAD_MAX_UTTERANCE_DURATION):
                     is_speaking = False
                     utterance = np.concatenate(audio_buffer)
-                    self.utterance_queue.put({"audio": utterance, "duration": now - utt_start_time})
+                    self.utterance_queue.put({"audio": utterance, "duration": now - utt_start_time, "created_at": time.time()})
                     audio_buffer.clear()
                     utt_start_time = None
                     last_voice_time = None
@@ -1121,8 +1122,13 @@ Use the museum sheet as ground truth if present.
 
     def _transcribe_audio(self, audio_int16: np.ndarray, force_language: str | None = None) -> tuple[str, str]:
         audio_float = audio_int16.astype(np.float32) / 32768.0
+        t0 = time.time()
         try:
-            kwargs = {"beam_size": 5, "vad_filter": False}
+            kwargs = {
+                "beam_size": WHISPER_BEAM_SIZE,
+                "vad_filter": False,
+                "condition_on_previous_text": False,
+            }
             if force_language:
                 kwargs["language"] = force_language
             segments, info = self.whisper.transcribe(audio_float, **kwargs)
@@ -1134,6 +1140,7 @@ Use the museum sheet as ground truth if present.
         if WHISPER_ALLOWED_LANGS and lang_code not in WHISPER_ALLOWED_LANGS:
             print(f"[STT] Detected unsupported lang '{lang_code}', rejecting as noise.")
             return ("", DEFAULT_LANG_CODE)
+        print(f"[Timing] STT: {time.time() - t0:.2f}s")
         return (text.strip(), lang_code)
 
     def _transcribe_worker(self) -> None:
@@ -1153,9 +1160,9 @@ Use the museum sheet as ground truth if present.
             lang_key = WHISPER_LANG_TO_KEY.get(lang_code, DEFAULT_LANGUAGE)
             self._set_active_language(lang_key)
             print(f"\n[Heard] ({lang_code}, dur={duration:.1f}s): {text}")
-            self._process_transcribed(text.lower().strip())
+            self._process_transcribed(text.lower().strip(), created_at=item.get("created_at"))
 
-    def _process_transcribed(self, text: str) -> None:
+    def _process_transcribed(self, text: str, created_at: float | None = None) -> None:
         if not text:
             return
         if _is_reboot_phrase(text):
@@ -1180,7 +1187,7 @@ Use the museum sheet as ground truth if present.
                 break
         if not text:
             return
-        self.request_queue.put({"kind": "user", "text": text, "created_at": time.time()})
+        self.request_queue.put({"kind": "user", "text": text, "created_at": created_at or time.time()})
 
     def _wait_for_profile_utterance(self, timeout_seconds: float = PROFILE_LISTEN_TIMEOUT_SECONDS) -> np.ndarray | None:
         try:
