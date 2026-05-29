@@ -34,11 +34,11 @@ from collections import deque
 
 import cv2
 import numpy as np
-import sounddevice as sd
+import sounddevice as sd # type: ignore
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv # type: ignore
 from google import genai
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel # type: ignore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from atlas.rag import RAG
@@ -428,7 +428,7 @@ class StatusLED:
         if not enabled:
             return
         try:
-            import Jetson.GPIO as GPIO
+            import Jetson.GPIO as GPIO # type: ignore
             self.GPIO = GPIO
             GPIO.setmode(GPIO.BOARD)
             for pin in self.pins.values():
