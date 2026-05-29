@@ -2,6 +2,10 @@
 
 ## Normal Startup
 
+
+
+EV3_MAC = "2C:6B:7D:7B:AE:02"
+
 Before a serious demo, warm the local caches:
 
 ```bash
