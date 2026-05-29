@@ -34,11 +34,11 @@ from collections import deque
 
 import cv2
 import numpy as np
-import sounddevice as sd
+import sounddevice as sd  # type: ignore
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv # type: ignore
 from google import genai
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel # type: ignore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from atlas.rag import RAG
