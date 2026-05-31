@@ -119,6 +119,7 @@ LED_RED_PIN = 29
 LED_GREEN_PIN = 31
 LED_BLUE_PIN = 33
 LED_COMMON_CATHODE = True
+JETSON_GPIO_MODEL_NAME = "JETSON_ORIN_NANO"
 
 LANGUAGES: dict[str, dict] = {
     "english": {
@@ -428,6 +429,7 @@ class StatusLED:
         if not enabled:
             return
         try:
+            os.environ.setdefault("JETSON_MODEL_NAME", JETSON_GPIO_MODEL_NAME)
             import Jetson.GPIO as GPIO # type: ignore
             self.GPIO = GPIO
             GPIO.setmode(GPIO.BOARD)

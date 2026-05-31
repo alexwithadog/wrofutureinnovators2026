@@ -15,6 +15,7 @@ If permissions fail:
   sudo python3 led_test.py
 """
 import argparse
+import os
 import sys
 import time
 
@@ -22,6 +23,7 @@ import time
 RED_PIN = 29
 GREEN_PIN = 31
 BLUE_PIN = 33
+JETSON_MODEL_NAME = "JETSON_ORIN_NANO"
 
 
 def main() -> int:
@@ -38,12 +40,16 @@ def main() -> int:
         help="Seconds to hold each color.",
     )
     args = parser.parse_args()
+    os.environ.setdefault("JETSON_MODEL_NAME", JETSON_MODEL_NAME)
 
     try:
         import Jetson.GPIO as GPIO
     except Exception as e:
         print(f"Could not import Jetson.GPIO: {e}")
         print("Run this on the Jetson, not on Windows/macOS.")
+        print("If you are already on the Jetson, try:")
+        print(f"  sudo JETSON_MODEL_NAME={JETSON_MODEL_NAME} python3 led_test.py")
+        print("If that still fails, update Jetson.GPIO to version 2.1.9 or newer.")
         return 1
 
     active = GPIO.LOW if args.common_anode else GPIO.HIGH
