@@ -230,22 +230,41 @@ PROFILE_SKIP_PHRASES = (
 LANGUAGE_SWITCH_MARKER = "LANGUAGE_SWITCH:"
 LANGUAGE_SWITCH_TARGETS = {
     "french": (
-        "francais", "francaise", "french",
+        "francais", "francaise", "francois", "french",
     ),
     "english": (
-        "anglais", "english",
+        "anglais", "anglaise", "english",
     ),
     "spanish": (
-        "espagnol", "espagnole", "espanol", "spanish",
+        "espagnol", "espagnole", "espanol", "espanole", "spanish",
     ),
     "italian": (
-        "italien", "italienne", "italiano", "italian",
+        "italien", "italienne", "italiano", "italiana", "italian",
     ),
 }
 LANGUAGE_SWITCH_VERBS = (
     "parle", "parlez", "parler", "reponds", "repondez", "repondre",
     "speak", "talk", "answer", "respond", "switch", "change",
+    "habla", "hablar", "responde", "responder",
+    "parla", "parlare", "rispondi", "rispondere",
 )
+
+LANGUAGE_HINTS = {
+    "french": (
+        "bonjour", "salut", "merci", "francais", "parle", "parlez", "reponds",
+        "qui", "quoi", "quel", "quelle", "comment", "pourquoi", "est ce",
+        "joconde", "masque", "pharaon", "toutankhamon", "etoile", "etoilee",
+        "nuit etoilee",
+    ),
+    "spanish": (
+        "hola", "gracias", "espanol", "habla", "hablar", "quien", "que",
+        "como", "por que", "estrella", "noche estrellada", "mascara",
+    ),
+    "italian": (
+        "ciao", "grazie", "italiano", "parla", "parlare", "chi", "che",
+        "come", "perche", "gioconda", "notte stellata", "maschera",
+    ),
+}
 
 MEMORY_TURNS = 10
 
@@ -299,15 +318,17 @@ YOLO_TO_ARTWORK_ID = {
 
 ARTWORK_QUERY_ALIASES = {
     "mona_lisa": (
-        "mona", "lisa", "joconde", "gioconda",
+        "mona", "lisa", "mona lisa", "monalisa", "joconde", "jaconde",
+        "gioconda", "la gioconda",
     ),
     "starry_night": (
         "starry", "starry night", "starry knight", "star", "stars",
-        "etoile", "etoiles", "nuit etoilee", "nuit etoile", "van gogh",
+        "etoile", "etoiles", "etoilee", "nuit etoilee", "nuit etoile",
+        "nuit des etoiles", "van gogh", "vangogh", "vincent",
     ),
     "pharaoh_mask": (
         "mask", "masque", "pharaoh", "pharaon", "tutankhamun", "toutankhamon",
-        "egyptian", "egyptien",
+        "toutankamon", "tutankamon", "egyptian", "egyptien", "egypte",
     ),
 }
 
@@ -421,16 +442,48 @@ def _detect_language_switch(text: str) -> str | None:
     if not norm:
         return None
     has_switch_intent = any(re.search(r"\b" + re.escape(verb) + r"\b", norm) for verb in LANGUAGE_SWITCH_VERBS)
+    has_polite_request = any(phrase in norm for phrase in (
+        "please", "s il vous plait", "stp",
+        "peux tu", "pouvez vous", "por favor", "per favore",
+    ))
     for lang_key, aliases in LANGUAGE_SWITCH_TARGETS.items():
         if not any(re.search(r"\b" + re.escape(alias) + r"\b", norm) for alias in aliases):
             continue
-        if has_switch_intent:
+        if has_switch_intent or has_polite_request:
             return lang_key
         for alias in aliases:
             if re.search(r"\b(en|in|a|to) " + re.escape(alias) + r"\b", norm):
                 return lang_key
         if norm in aliases:
             return lang_key
+    return None
+
+
+def _infer_language_from_text(text: str) -> str | None:
+    norm = _strip_accents(text)
+    norm = re.sub(r"[^a-z0-9]+", " ", norm).strip()
+    if not norm:
+        return None
+    scores: dict[str, int] = {}
+    for lang_key, hints in LANGUAGE_HINTS.items():
+        score = 0
+        for hint in hints:
+            hint_norm = _strip_accents(hint)
+            if re.search(r"\b" + re.escape(hint_norm) + r"\b", norm):
+                score += 2 if " " in hint_norm else 1
+        scores[lang_key] = score
+    best_lang, best_score = max(scores.items(), key=lambda item: item[1])
+    if best_score >= 2:
+        return best_lang
+    if best_score == 1 and _detect_artwork_query(norm):
+        return best_lang
+    return None
+
+
+def _language_key_to_code(lang_key: str) -> str | None:
+    for code, key in WHISPER_LANG_TO_KEY.items():
+        if key == lang_key:
+            return code
     return None
 
 
@@ -614,6 +667,8 @@ LANGUAGE_SWITCH:english
 LANGUAGE_SWITCH:french
 LANGUAGE_SWITCH:spanish
 LANGUAGE_SWITCH:italian
+If the LANGUAGE INSTRUCTION says to respond in French, Spanish, or Italian, fully answer in that language even if the speech transcript contains a few English-looking words from recognition errors.
+Never say that this experience is English-only.
 
 What you will answer
 You are an educational and cultural guide first. ANSWER any reasonable question about art, history, culture, artifacts, artworks, artists, architecture, literature, mythology, religion, science, nature, geography, historical events, historical figures, museums, and general knowledge an educated museum guide would know, whether or not the subject is physically in front of the visitor.
@@ -1412,6 +1467,15 @@ Use the museum sheet as ground truth if present.
                 continue
             text, lang_code = self._rescue_french_transcription(audio_int16, text, lang_code)
             lang_key = WHISPER_LANG_TO_KEY.get(lang_code, DEFAULT_LANGUAGE)
+            inferred_lang = _detect_language_switch(text) or _infer_language_from_text(text)
+            if inferred_lang and inferred_lang in LANGUAGES and inferred_lang != lang_key:
+                inferred_code = _language_key_to_code(inferred_lang)
+                if inferred_code:
+                    print(f"[Lang] transcript hints override: {lang_key} -> {inferred_lang}")
+                    lang_key = inferred_lang
+                    lang_code = inferred_code
+                    if self.profile_language_locked and inferred_lang != self._get_active_language():
+                        self._lock_profile_language(inferred_lang)
             self._set_active_language(lang_key)
             print(f"\n[Heard] ({lang_code}, dur={duration:.1f}s): {text}")
             self._process_transcribed(text.lower().strip(), created_at=item.get("created_at"))
