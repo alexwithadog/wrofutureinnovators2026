@@ -1,7 +1,11 @@
+#!/usr/bin/env python3
+import os
+# MUST be set BEFORE importing Jetson.GPIO
+os.environ['JETSON_MODEL_NAME'] = 'JETSON_ORIN_NANO'
+
 import Jetson.GPIO as GPIO
 import time
 
-# Physical pin numbers (BOARD mode)
 RED_PIN   = 29
 GREEN_PIN = 31
 BLUE_PIN  = 33
@@ -27,10 +31,10 @@ try:
     print("BLUE on  (2s)")
     set_color(0, 0, 1); time.sleep(2)
 
-    print("ALL on  (looks whitish) (2s)")
+    print("ALL on  (whitish) (2s)")
     set_color(1, 1, 1); time.sleep(2)
 
-    print("ALL off  (1s)")
+    print("OFF (1s)")
     set_color(0, 0, 0); time.sleep(1)
 
     print("Cycling R→G→B x3")
