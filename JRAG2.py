@@ -247,16 +247,6 @@ LANGUAGE_SWITCH_VERBS = (
     "speak", "talk", "answer", "respond", "switch", "change",
 )
 
-FRENCH_MISHEAR_RESCUES = {
-    "who is there": "qui est la joconde",
-    "who's there": "qui est la joconde",
-    "whos there": "qui est la joconde",
-    "who is she": "qui est la joconde",
-    "who's she": "qui est la joconde",
-    "who is la": "qui est la joconde",
-    "who's la": "qui est la joconde",
-}
-
 MEMORY_TURNS = 10
 
 ENABLE_YOLO = True
@@ -453,12 +443,6 @@ def _parse_language_switch_marker(text: str) -> str | None:
         return None
     target = cleaned[len(marker):].strip().split(None, 1)[0] if len(cleaned) > len(marker) else ""
     return target if target in LANGUAGES else None
-
-
-def _french_mishear_rescue(text: str) -> str | None:
-    norm = _strip_accents(text)
-    norm = re.sub(r"[^a-z0-9']+", " ", norm).strip()
-    return FRENCH_MISHEAR_RESCUES.get(norm)
 
 
 def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
@@ -1388,10 +1372,6 @@ Use the museum sheet as ground truth if present.
         return any(word in norm for word in ("joconde", "francais", "etoile", "masque"))
 
     def _rescue_french_transcription(self, audio_int16: np.ndarray, text: str, lang_code: str) -> tuple[str, str]:
-        mapped = _french_mishear_rescue(text)
-        if mapped and (self._get_active_language() == "french" or _detect_artwork_query(mapped)):
-            print(f"[STT] French rescue mapped: {text!r} -> {mapped!r}")
-            return (mapped, "fr")
         if not self._should_try_french_rescue(text, lang_code):
             return (text, lang_code)
         fr_text, fr_lang = self._transcribe_audio(
