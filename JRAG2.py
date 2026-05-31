@@ -98,10 +98,12 @@ ARTWORK_SPOKEN_NAMES = {
 
 MOTOR_LOWER_DELAY_SECONDS = 5.0
 
-WHISPER_MODEL_SIZE = "tiny"
+WHISPER_MODEL_SIZE = "base"
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE = "int8"
-WHISPER_BEAM_SIZE = 1
+WHISPER_BEAM_SIZE = 5
+WHISPER_PROFILE_BEAM_SIZE = 5
+WHISPER_LANGUAGE_LOCK_AFTER_PROFILE = True
 WHISPER_ALLOWED_LANGS = {"en", "fr", "es", "it"}
 DEFAULT_LANG_CODE = "en"
 
@@ -428,6 +430,7 @@ class MuseumHelmet:
 
         self.current_language = DEFAULT_LANGUAGE
         self.language_lock = threading.Lock()
+        self.profile_language_locked = False
 
         self.has_display = _has_display()
         if self.has_display:
@@ -795,10 +798,23 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
     def _set_active_language(self, lang_key: str) -> None:
         if lang_key not in LANGUAGES:
             return
+        if WHISPER_LANGUAGE_LOCK_AFTER_PROFILE and self.profile_language_locked:
+            return
         with self.language_lock:
             if self.current_language != lang_key:
                 print(f"[Lang] auto-detected: {self.current_language} -> {lang_key}")
                 self.current_language = lang_key
+
+    def _lock_profile_language(self, lang_key: str) -> None:
+        if lang_key not in LANGUAGES:
+            return
+        with self.language_lock:
+            if self.current_language != lang_key:
+                print(f"[Lang] profile locked: {self.current_language} -> {lang_key}")
+            else:
+                print(f"[Lang] profile locked: {lang_key}")
+            self.current_language = lang_key
+            self.profile_language_locked = True
 
     def _get_active_voice(self) -> str:
         return LANGUAGES[self._get_active_language()]["piper_voice"]
@@ -1196,12 +1212,17 @@ Use the museum sheet as ground truth if present.
         except Exception as e:
             print(f"[STT] Listener error: {e}")
 
-    def _transcribe_audio(self, audio_int16: np.ndarray, force_language: str | None = None) -> tuple[str, str]:
+    def _transcribe_audio(
+        self,
+        audio_int16: np.ndarray,
+        force_language: str | None = None,
+        beam_size: int | None = None,
+    ) -> tuple[str, str]:
         audio_float = audio_int16.astype(np.float32) / 32768.0
         t0 = time.time()
         try:
             kwargs = {
-                "beam_size": WHISPER_BEAM_SIZE,
+                "beam_size": beam_size or WHISPER_BEAM_SIZE,
                 "vad_filter": False,
                 "condition_on_previous_text": False,
             }
@@ -1232,7 +1253,14 @@ Use the museum sheet as ground truth if present.
                 continue
             if not self.demo_ready_event.is_set():
                 continue
-            text, lang_code = self._transcribe_audio(audio_int16)
+            force_language = None
+            if WHISPER_LANGUAGE_LOCK_AFTER_PROFILE and self.profile_language_locked:
+                active_lang = self._get_active_language()
+                for code, key in WHISPER_LANG_TO_KEY.items():
+                    if key == active_lang:
+                        force_language = code
+                        break
+            text, lang_code = self._transcribe_audio(audio_int16, force_language=force_language)
             if not text:
                 continue
             lang_key = WHISPER_LANG_TO_KEY.get(lang_code, DEFAULT_LANGUAGE)
@@ -1291,7 +1319,7 @@ Use the museum sheet as ground truth if present.
                     self.say_phrase_blocking("didnt_catch")
                     continue
                 return None
-            text, lang_code = self._transcribe_audio(audio)
+            text, lang_code = self._transcribe_audio(audio, beam_size=WHISPER_PROFILE_BEAM_SIZE)
             if not text:
                 if attempt < retries:
                     self.say_phrase_blocking("didnt_catch")
@@ -1302,7 +1330,7 @@ Use the museum sheet as ground truth if present.
             if _is_profile_skip_phrase(text):
                 raise _ProfileSkipRequested()
             lang_key = WHISPER_LANG_TO_KEY.get(lang_code, DEFAULT_LANGUAGE)
-            self._set_active_language(lang_key)
+            self._lock_profile_language(lang_key)
             print(f"[Profile heard] ({lang_code}): {text}")
             return text.strip()
         return None
@@ -1354,6 +1382,7 @@ Use the museum sheet as ground truth if present.
         self._motor_raise_all()
         with self.language_lock:
             self.current_language = DEFAULT_LANGUAGE
+            self.profile_language_locked = False
         self.say_phrase_blocking("reboot_ack")
         self._run_profile_flow()
 
