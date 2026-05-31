@@ -134,6 +134,7 @@ LANGUAGES: dict[str, dict] = {
         "ask_profession": "What do you do? For example, are you a student, a teacher, a tourist, or something else?",
         "ask_interest": "How would you describe your interest in art and history? Beginner, enthusiast, or expert?",
         "profile_thanks": "Great, thank you. Now feel free to ask me anything about art, history, or culture.",
+        "language_changed": "Sure, I'll speak English now.",
         "reboot_ack": "Of course. Let me start fresh.",
         "didnt_catch": "Sorry, I didn't catch that. Could you say it again?",
         "gemini_directive": "Respond ONLY in English.",
@@ -151,6 +152,7 @@ LANGUAGES: dict[str, dict] = {
         "ask_profession": "Que faites-vous dans la vie? Par exemple, etes-vous etudiant, enseignant, touriste, ou autre chose?",
         "ask_interest": "Comment decririez-vous votre interet pour l'art et l'histoire? Debutant, passionne, ou expert?",
         "profile_thanks": "Parfait, merci. Maintenant, n'hesitez pas a me poser n'importe quelle question sur l'art, l'histoire ou la culture.",
+        "language_changed": "Bien sur, je parlerai en francais maintenant.",
         "reboot_ack": "Bien sur. Je recommence depuis le debut.",
         "didnt_catch": "Desole, je n'ai pas bien compris. Pouvez-vous repeter?",
         "gemini_directive": "Respond ONLY in French.",
@@ -168,6 +170,7 @@ LANGUAGES: dict[str, dict] = {
         "ask_profession": "A que te dedicas? Por ejemplo, eres estudiante, profesor, turista, u otra cosa?",
         "ask_interest": "Como describirias tu interes por el arte y la historia? Principiante, aficionado, o experto?",
         "profile_thanks": "Perfecto, gracias. Ahora, sientete libre de preguntarme cualquier cosa sobre arte, historia o cultura.",
+        "language_changed": "Claro, hablare en espanol ahora.",
         "reboot_ack": "Por supuesto. Empezamos de nuevo.",
         "didnt_catch": "Disculpa, no te entendi bien. Podrias repetirlo?",
         "gemini_directive": "Respond ONLY in Spanish.",
@@ -185,6 +188,7 @@ LANGUAGES: dict[str, dict] = {
         "ask_profession": "Cosa fai nella vita? Per esempio, sei uno studente, un insegnante, un turista, o qualcos'altro?",
         "ask_interest": "Come descriveresti il tuo interesse per l'arte e la storia? Principiante, appassionato, o esperto?",
         "profile_thanks": "Perfetto, grazie. Ora, sentiti libero di chiedermi qualsiasi cosa sull'arte, la storia o la cultura.",
+        "language_changed": "Certo, parlero in italiano adesso.",
         "reboot_ack": "Certo. Ricomincio da capo.",
         "didnt_catch": "Scusa, non ho capito bene. Puoi ripetere?",
         "gemini_directive": "Respond ONLY in Italian.",
@@ -202,6 +206,7 @@ CACHED_PHRASE_KEYS = [
     ("ask_profession", "ask_profession"),
     ("ask_interest", "ask_interest"),
     ("profile_thanks", "profile_thanks"),
+    ("language_changed", "language_changed"),
     ("reboot_ack", "reboot_ack"),
     ("didnt_catch", "didnt_catch"),
     ("exit_phrase", "exit_phrase"),
@@ -218,6 +223,26 @@ REBOOT_PHRASES = (
 
 PROFILE_SKIP_PHRASES = (
     "skip", "skip profile", "skip setup", "skip questions", "test mode",
+)
+
+LANGUAGE_SWITCH_MARKER = "LANGUAGE_SWITCH:"
+LANGUAGE_SWITCH_TARGETS = {
+    "french": (
+        "francais", "francaise", "french",
+    ),
+    "english": (
+        "anglais", "english",
+    ),
+    "spanish": (
+        "espagnol", "espagnole", "espanol", "spanish",
+    ),
+    "italian": (
+        "italien", "italienne", "italiano", "italian",
+    ),
+}
+LANGUAGE_SWITCH_VERBS = (
+    "parle", "parlez", "parler", "reponds", "repondez", "repondre",
+    "speak", "talk", "answer", "respond", "switch", "change",
 )
 
 MEMORY_TURNS = 10
@@ -349,6 +374,36 @@ def _is_profile_skip_phrase(text: str) -> bool:
         if re.search(r"\b" + re.escape(_strip_accents(phrase)) + r"\b", norm):
             return True
     return False
+
+
+def _detect_language_switch(text: str) -> str | None:
+    norm = _strip_accents(text)
+    norm = re.sub(r"[^a-z0-9]+", " ", norm).strip()
+    if not norm:
+        return None
+    has_switch_intent = any(re.search(r"\b" + re.escape(verb) + r"\b", norm) for verb in LANGUAGE_SWITCH_VERBS)
+    for lang_key, aliases in LANGUAGE_SWITCH_TARGETS.items():
+        if not any(re.search(r"\b" + re.escape(alias) + r"\b", norm) for alias in aliases):
+            continue
+        if has_switch_intent:
+            return lang_key
+        for alias in aliases:
+            if re.search(r"\b(en|in|a|to) " + re.escape(alias) + r"\b", norm):
+                return lang_key
+        if norm in aliases:
+            return lang_key
+    return None
+
+
+def _parse_language_switch_marker(text: str) -> str | None:
+    if not text:
+        return None
+    cleaned = _strip_accents(text)
+    marker = _strip_accents(LANGUAGE_SWITCH_MARKER)
+    if not cleaned.startswith(marker):
+        return None
+    target = cleaned[len(marker):].strip().split(None, 1)[0] if len(cleaned) > len(marker) else ""
+    return target if target in LANGUAGES else None
 
 
 def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
@@ -513,6 +568,13 @@ The visitor's words come from a speech-to-text system that sometimes mishears si
 - "moaner Lisa" or strange spellings of Mona Lisa -> they mean Mona Lisa
 - "fair away" or "fer away" -> "far away"
 Never ask the visitor to repeat unless the sentence is genuinely incomprehensible. Just answer the most likely question.
+
+Multilingual switching
+Atlas supports English, French, Spanish, and Italian. If the visitor asks to change language, speak in another language, or says something like "Parle-moi en francais", do not refuse and do not explain that you are set to another language. If the system has not already handled the switch, reply with exactly one of these markers and nothing else:
+LANGUAGE_SWITCH:english
+LANGUAGE_SWITCH:french
+LANGUAGE_SWITCH:spanish
+LANGUAGE_SWITCH:italian
 
 What you will answer
 You are an educational and cultural guide first. ANSWER any reasonable question about art, history, culture, artifacts, artworks, artists, architecture, literature, mythology, religion, science, nature, geography, historical events, historical figures, museums, and general knowledge an educated museum guide would know, whether or not the subject is physically in front of the visitor.
@@ -1117,6 +1179,17 @@ Use the museum sheet as ground truth if present.
             self.last_speak_end_time = time.time()
             return
         if kind == "user":
+            target_language = _parse_language_switch_marker(response)
+            if target_language:
+                print(f"[Lang] Gemini switch marker -> {target_language}")
+                self._lock_profile_language(target_language)
+                self.say_phrase_blocking("language_changed")
+                with self.memory_lock:
+                    if self.memory and self.memory[-1] == ("user", text):
+                        self.memory.pop()
+                self.is_busy_event.clear()
+                self.last_speak_end_time = time.time()
+                return
             first_token = (response.split(None, 1)[0].strip().rstrip(".").upper() if response else "")
             if first_token == "SKIP":
                 print("[Gemini] SKIP - bystander noise, staying silent.")
@@ -1286,6 +1359,12 @@ Use the museum sheet as ground truth if present.
                     self.last_speak_end_time = time.time()
             self._motor_raise_all()
             self.stop_event.set()
+            return
+        target_language = _detect_language_switch(text)
+        if target_language:
+            print(f"[Lang] explicit switch request -> {target_language}: {text}")
+            self._lock_profile_language(target_language)
+            self.say_phrase_blocking("language_changed")
             return
         for w in WAKE_WORDS:
             if text.startswith(w + " ") or text == w:
