@@ -1,103 +1,52 @@
 #!/usr/bin/env python3
-"""
-Standalone KY-016 RGB LED test for the Jetson GPIO header.
-
-Wiring expected:
-  KY-016 R       -> Jetson physical pin 29
-  KY-016 G       -> Jetson physical pin 31
-  KY-016 B       -> Jetson physical pin 33
-  KY-016 - / GND -> Jetson physical pin 30
-
-Run:
-  python3 led_test.py
-
-If permissions fail:
-  sudo python3 led_test.py
-"""
-import argparse
 import os
-import sys
+# MUST be set BEFORE importing Jetson.GPIO
+os.environ['JETSON_MODEL_NAME'] = 'JETSON_ORIN_NANO'
+
+import Jetson.GPIO as GPIO
 import time
 
-
-RED_PIN = 29
+RED_PIN   = 29
 GREEN_PIN = 31
-BLUE_PIN = 33
-JETSON_MODEL_NAME = "JETSON_ORIN_NANO"
+BLUE_PIN  = 33
 
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+GPIO.setup(RED_PIN,   GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(GREEN_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(BLUE_PIN,  GPIO.OUT, initial=GPIO.LOW)
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Test the ATLAS KY-016 RGB status LED.")
-    parser.add_argument(
-        "--common-anode",
-        action="store_true",
-        help="Invert GPIO logic if your RGB LED is common-anode instead of KY-016 common-cathode.",
-    )
-    parser.add_argument(
-        "--hold",
-        type=float,
-        default=1.0,
-        help="Seconds to hold each color.",
-    )
-    args = parser.parse_args()
-    os.environ.setdefault("JETSON_MODEL_NAME", JETSON_MODEL_NAME)
+def set_color(r, g, b):
+    GPIO.output(RED_PIN,   GPIO.HIGH if r else GPIO.LOW)
+    GPIO.output(GREEN_PIN, GPIO.HIGH if g else GPIO.LOW)
+    GPIO.output(BLUE_PIN,  GPIO.HIGH if b else GPIO.LOW)
 
-    try:
-        import Jetson.GPIO as GPIO
-    except Exception as e:
-        print(f"Could not import Jetson.GPIO: {e}")
-        print("Run this on the Jetson, not on Windows/macOS.")
-        print("If you are already on the Jetson, try:")
-        print(f"  sudo JETSON_MODEL_NAME={JETSON_MODEL_NAME} python3 led_test.py")
-        print("If that still fails, update Jetson.GPIO to version 2.1.9 or newer.")
-        return 1
+try:
+    print("RED on  (2s)")
+    set_color(1, 0, 0); time.sleep(2)
 
-    active = GPIO.LOW if args.common_anode else GPIO.HIGH
-    inactive = GPIO.HIGH if args.common_anode else GPIO.LOW
+    print("GREEN on  (2s)")
+    set_color(0, 1, 0); time.sleep(2)
 
-    def level(on: bool):
-        return active if on else inactive
+    print("BLUE on  (2s)")
+    set_color(0, 0, 1); time.sleep(2)
 
-    def set_color(name: str, r: bool, g: bool, b: bool) -> None:
-        print(f"Showing {name}...")
-        GPIO.output(RED_PIN, level(r))
-        GPIO.output(GREEN_PIN, level(g))
-        GPIO.output(BLUE_PIN, level(b))
-        time.sleep(args.hold)
+    print("ALL on  (whitish) (2s)")
+    set_color(1, 1, 1); time.sleep(2)
 
-    print("ATLAS RGB LED test")
-    print(f"Using BOARD pins: R={RED_PIN}, G={GREEN_PIN}, B={BLUE_PIN}, GND=30")
-    print("Make sure the Jetson is wired with power off before running this.")
-    print("Press Ctrl-C to stop.")
+    print("OFF (1s)")
+    set_color(0, 0, 0); time.sleep(1)
 
-    try:
-        GPIO.setmode(GPIO.BOARD)
-        for pin in (RED_PIN, GREEN_PIN, BLUE_PIN):
-            GPIO.setup(pin, GPIO.OUT, initial=inactive)
+    print("Cycling R→G→B x3")
+    for _ in range(3):
+        set_color(1, 0, 0); time.sleep(0.4)
+        set_color(0, 1, 0); time.sleep(0.4)
+        set_color(0, 0, 1); time.sleep(0.4)
 
-        while True:
-            set_color("red", True, False, False)
-            set_color("green", False, True, False)
-            set_color("blue", False, False, True)
-            set_color("yellow", True, True, False)
-            set_color("purple", True, False, True)
-            set_color("cyan", False, True, True)
-            set_color("white", True, True, True)
-            set_color("off", False, False, False)
-            print("Cycle complete.\n")
-    except KeyboardInterrupt:
-        print("\nStopping LED test.")
-    finally:
-        try:
-            GPIO.output(RED_PIN, inactive)
-            GPIO.output(GREEN_PIN, inactive)
-            GPIO.output(BLUE_PIN, inactive)
-            GPIO.cleanup()
-        except Exception:
-            pass
+    print("Done.")
 
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+except KeyboardInterrupt:
+    print("\nInterrupted")
+finally:
+    set_color(0, 0, 0)
+    GPIO.cleanup()
