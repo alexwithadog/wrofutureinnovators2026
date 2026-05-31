@@ -4,8 +4,8 @@ Standalone KY-016 RGB LED test for the Jetson GPIO header.
 
 Wiring expected:
   KY-016 R       -> Jetson physical pin 15
-  KY-016 G       -> Jetson physical pin 32
-  KY-016 B       -> Jetson physical pin 33
+  KY-016 G       -> Jetson physical pin 18
+  KY-016 B       -> Jetson physical pin 32
   KY-016 - / GND -> Jetson physical pin 30
 
 Run:
@@ -21,8 +21,8 @@ import time
 
 
 RED_PIN = 15
-GREEN_PIN = 32
-BLUE_PIN = 33
+GREEN_PIN = 18
+BLUE_PIN = 32
 JETSON_MODEL_NAME = "JETSON_ORIN_NANO"
 
 
