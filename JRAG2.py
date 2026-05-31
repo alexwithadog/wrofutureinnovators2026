@@ -56,9 +56,14 @@ AUDIO_OUT_DEVICE: str | None = "plughw:0,0"
 
 PIPER_DATA_DIR = os.path.expanduser("~/piper_voices")
 PIPER_LENGTH_SCALE = 0.92
+PIPER_CACHE_TAG = f"ls{str(PIPER_LENGTH_SCALE).replace('.', 'p')}"
 
 ACK_CACHE_DIR = os.path.expanduser("~/.atlas_ack_cache")
-PRECACHE_ALL_LANGUAGES = False
+PRECACHE_ALL_LANGUAGES = True
+STARTUP_WAIT_FOR_TERMINAL = True
+STARTUP_MOTOR_WAIT_SECONDS = 8.0
+STARTUP_CAMERA_WAIT_SECONDS = 5.0
+STARTUP_GEMINI_WARMUP_TIMEOUT_SECONDS = 6.0
 
 EV3_MAC = "2C:6B:7D:7B:AE:02"
 YOLO_TO_SLOT = {
@@ -452,6 +457,8 @@ class MuseumHelmet:
         self.stop_event = threading.Event()
         self.is_busy_event = threading.Event()
         self.in_profile_flow = threading.Event()
+        self.demo_ready_event = threading.Event()
+        self.camera_ready_event = threading.Event()
         self.profile_inbox: queue.Queue = queue.Queue()
 
         self.speak_start_time = 0.0
@@ -602,13 +609,13 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
     def _start_rag_background(self) -> None:
         threading.Thread(target=self._load_rag, daemon=True).start()
 
-    def _load_yolo(self) -> None:
+    def _load_yolo(self):
         if not ENABLE_YOLO:
             self.yolo_ready.set()
-            return
+            return None
         with self.yolo_lock:
             if self.yolo_model is not None or self.yolo_failed:
-                return
+                return self.yolo_model
             try:
                 from ultralytics import YOLO
                 print(f"[YOLO] Loading {YOLO_WEIGHTS_PATH}...")
@@ -627,9 +634,78 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                 print(f"[YOLO] Failed to load: {e}. Continuing without detection.")
             finally:
                 self.yolo_ready.set()
+            return self.yolo_model
 
     def _start_yolo_background(self) -> None:
         threading.Thread(target=self._load_yolo, daemon=True).start()
+
+    def _warm_up_yolo(self) -> None:
+        if not ENABLE_YOLO or self.yolo_model is None:
+            return
+        try:
+            print("[YOLO] Warming up inference...")
+            dummy = np.zeros((CAMERA_PROCESS_SIZE[1], CAMERA_PROCESS_SIZE[0], 3), dtype=np.uint8)
+            t0 = time.time()
+            self.yolo_model.predict(dummy, imgsz=YOLO_IMGSZ, verbose=False, device=self.yolo_device)
+            print(f"[YOLO] Warmup ready in {time.time() - t0:.2f}s.")
+        except Exception as e:
+            print(f"[YOLO] Warmup skipped: {e}")
+
+    def _warm_up_whisper(self) -> None:
+        try:
+            print("[STT] Warming up Whisper decode...")
+            silence = np.zeros(int(MIC_SAMPLE_RATE * 0.6), dtype=np.int16)
+            t0 = time.time()
+            self._transcribe_audio(silence, force_language=DEFAULT_LANG_CODE)
+            print(f"[STT] Whisper warmup ready in {time.time() - t0:.2f}s.")
+        except Exception as e:
+            print(f"[STT] Whisper warmup skipped: {e}")
+
+    def _warm_up_gemini(self) -> None:
+        print(f"[Gemini] Warming up {GEMINI_MODEL_CAMERA} connection...")
+        result_holder: dict[str, str] = {}
+
+        def run():
+            try:
+                result_holder["text"] = self._gemini_try_once(
+                    GEMINI_MODEL_CAMERA,
+                    "Reply with exactly: OK",
+                )
+            except Exception as e:
+                result_holder["error"] = str(e)
+
+        t0 = time.time()
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=STARTUP_GEMINI_WARMUP_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            print("[Gemini] Warmup still pending; continuing startup.")
+            return
+        if "error" in result_holder:
+            print(f"[Gemini] Warmup skipped: {result_holder['error']}")
+            return
+        print(f"[Gemini] Warmup ready in {time.time() - t0:.2f}s.")
+
+    def _preload_competition_runtime(self) -> None:
+        print("[Startup] Competition preload: caching phrases and loading models before demo start.")
+        t0 = time.time()
+        self._prepare_ack_wavs()
+        self._load_rag()
+        self._load_yolo()
+        self._warm_up_yolo()
+        self._warm_up_whisper()
+        self._warm_up_gemini()
+        print(f"[Startup] Competition preload complete in {time.time() - t0:.2f}s.")
+
+    def _wait_for_terminal_start(self) -> None:
+        if not STARTUP_WAIT_FOR_TERMINAL:
+            return
+        print("\n[Startup] ATLAS is fully preloaded.")
+        print("[Startup] Press Enter when the helmet is on and you want ATLAS to start talking.")
+        try:
+            input("> ")
+        except EOFError:
+            print("[Startup] No terminal input available; starting now.")
 
     def _prepare_ack_wavs(self) -> None:
         print(f"[Piper] Checking local phrase cache at {ACK_CACHE_DIR} ...")
@@ -644,7 +720,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
             voice = cfg["piper_voice"]
             self._ack_wavs[lang_name] = {"first_try": []}
             for i, phrase in enumerate(cfg["ack_first"]):
-                path = os.path.join(ACK_CACHE_DIR, f"ack_first_{lang_name}_{i}.wav")
+                path = os.path.join(ACK_CACHE_DIR, f"ack_first_{lang_name}_{i}_{PIPER_CACHE_TAG}.wav")
                 already = os.path.exists(path) and os.path.getsize(path) > 0
                 if _ensure_ack_wav(voice, phrase, path):
                     self._ack_wavs[lang_name]["first_try"].append(path)
@@ -653,7 +729,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
                     else:
                         rendered += 1
             for kind, src_key in CACHED_PHRASE_KEYS:
-                path = os.path.join(ACK_CACHE_DIR, f"{kind}_{lang_name}.wav")
+                path = os.path.join(ACK_CACHE_DIR, f"{kind}_{lang_name}_{PIPER_CACHE_TAG}.wav")
                 already = os.path.exists(path) and os.path.getsize(path) > 0
                 if _ensure_ack_wav(voice, cfg[src_key], path):
                     self._ack_wavs[lang_name][kind] = path
@@ -812,7 +888,7 @@ CRITICAL OUTPUT FORMAT RULES, these are read aloud by a text-to-speech engine:
         wav_path = lang_cache.get(phrase_key)
         if not wav_path and text:
             voice = LANGUAGES[lang]["piper_voice"]
-            path = os.path.join(ACK_CACHE_DIR, f"{phrase_key}_{lang}.wav")
+            path = os.path.join(ACK_CACHE_DIR, f"{phrase_key}_{lang}_{PIPER_CACHE_TAG}.wav")
             if _ensure_ack_wav(voice, text, path):
                 lang_cache[phrase_key] = path
                 wav_path = path
@@ -1154,6 +1230,8 @@ Use the museum sheet as ground truth if present.
             if self.in_profile_flow.is_set():
                 self.profile_inbox.put({"audio": audio_int16, "duration": duration})
                 continue
+            if not self.demo_ready_event.is_set():
+                continue
             text, lang_code = self._transcribe_audio(audio_int16)
             if not text:
                 continue
@@ -1297,6 +1375,7 @@ Use the museum sheet as ground truth if present.
                 print("[Camera] Could not read first frame, disabling.")
                 return
             print(f"[Camera] Open OK, frame shape: {test_frame.shape}")
+            self.camera_ready_event.set()
             frame_idx = 0
             last_annotated = None
             last_fps = 0.0
@@ -1385,6 +1464,8 @@ Use the museum sheet as ground truth if present.
     def _maybe_trigger_object_explanation(self, detections: list[dict]) -> None:
         if not ENABLE_YOLO:
             return
+        if not self.demo_ready_event.is_set():
+            return
         if self.in_profile_flow.is_set():
             return
         current_time = time.time()
@@ -1444,9 +1525,7 @@ Use the museum sheet as ground truth if present.
             self.object_first_seen_time = current_time
 
     def start(self) -> None:
-        self._prepare_ack_wavs()
-        self._start_rag_background()
-        self._start_yolo_background()
+        self._preload_competition_runtime()
         print("[Motor] Starting background connection to EV3 ...")
         self.motor.connect_in_background()
 
@@ -1462,7 +1541,25 @@ Use the museum sheet as ground truth if present.
         motor_idle_thread = threading.Thread(target=self._motor_idle_watcher, daemon=True)
         motor_idle_thread.start()
 
-        print("[Startup] Threads started. Beginning visitor profile flow.")
+        if self.camera_ready_event.wait(timeout=STARTUP_CAMERA_WAIT_SECONDS):
+            print("[Startup] Camera thread ready.")
+        else:
+            print("[Startup] Camera was not ready before timeout; continuing anyway.")
+        motor_wait_start = time.time()
+        while (
+            not self.motor.connected
+            and (time.time() - motor_wait_start) < STARTUP_MOTOR_WAIT_SECONDS
+            and not self.stop_event.is_set()
+        ):
+            time.sleep(0.1)
+        if self.motor.connected:
+            print("[Startup] EV3 motor link ready.")
+        else:
+            print("[Startup] EV3 motor link not ready yet; it will keep connecting in background.")
+
+        self._wait_for_terminal_start()
+        self.demo_ready_event.set()
+        print("[Startup] Demo started. Beginning visitor profile flow.")
         self._run_profile_flow()
 
         try:
