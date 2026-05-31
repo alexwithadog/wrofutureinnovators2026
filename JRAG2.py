@@ -115,7 +115,7 @@ WHISPER_LANG_TO_KEY = {
 }
 
 VAD_ENERGY_THRESHOLD = 500
-VAD_SILENCE_DURATION = 0.45
+VAD_SILENCE_DURATION = 0.75
 VAD_MIN_UTTERANCE_DURATION = 0.5
 VAD_MAX_UTTERANCE_DURATION = 15.0
 
@@ -279,10 +279,34 @@ ACK_DELAY_SECONDS = 1.5
 RAG_SCORE_THRESHOLD = 0.25
 RAG_TOP_K = 1
 
+EXHIBIT_CONTEXT = """
+[Current exhibit]
+Atlas is guiding a small museum display with exactly these three featured artworks or artifacts:
+- Mona Lisa, by Leonardo da Vinci.
+- The Starry Night, by Vincent van Gogh.
+- The Mask of Tutankhamun, also called the pharaoh mask or Egyptian mask.
+If the visitor asks about "the star one", "starry", "l'etoile", "la nuit etoilee", "the mask", "le masque", "Mona", or "la Joconde", map that to the matching item above and answer confidently.
+[End of current exhibit]
+"""
+
 YOLO_TO_ARTWORK_ID = {
     "mona_lisa":    "mona_lisa",
     "starry_night": "starry_night",
     "pharaoh_mask": "pharaoh_mask",
+}
+
+ARTWORK_QUERY_ALIASES = {
+    "mona_lisa": (
+        "mona", "lisa", "joconde", "gioconda",
+    ),
+    "starry_night": (
+        "starry", "starry night", "starry knight", "star", "stars",
+        "etoile", "etoiles", "nuit etoilee", "nuit etoile", "van gogh",
+    ),
+    "pharaoh_mask": (
+        "mask", "masque", "pharaoh", "pharaon", "tutankhamun", "toutankhamon",
+        "egyptian", "egyptien",
+    ),
 }
 
 PROFILE_MAX_RETRIES = 1
@@ -322,6 +346,19 @@ def _artwork_spoken_name(artwork_id: str) -> str:
 
 def _object_threshold(thresholds: dict[str, float], object_name: str, default: float) -> float:
     return thresholds.get(object_name, default)
+
+
+def _detect_artwork_query(text: str) -> str | None:
+    norm = _strip_accents(text)
+    norm = re.sub(r"[^a-z0-9]+", " ", norm).strip()
+    if not norm:
+        return None
+    for artwork_id, aliases in ARTWORK_QUERY_ALIASES.items():
+        for alias in aliases:
+            alias_norm = _strip_accents(alias)
+            if re.search(r"\b" + re.escape(alias_norm) + r"\b", norm):
+                return artwork_id
+    return None
 
 
 def _parse_age(text: str) -> int | None:
@@ -1085,13 +1122,19 @@ Otherwise, answer normally as the museum guide.
 
     def _build_user_prompt(self, user_text: str) -> str:
         directive = self._get_active_gemini_directive()
-        rag_block = self._retrieve_rag_context(user_text)
+        artwork_id = _detect_artwork_query(user_text)
+        if artwork_id:
+            rag_block = self._retrieve_rag_by_id(artwork_id)
+        else:
+            rag_block = self._retrieve_rag_context(user_text)
         profile_block = self._profile_block()
         return f"""{self.system_prompt}
 
 LANGUAGE INSTRUCTION: {directive}
 
 {self.formatting_rules}
+
+{EXHIBIT_CONTEXT}
 
 {profile_block}
 Conversation so far (most recent last):
@@ -1121,6 +1164,8 @@ About every other response, end with a short curious question back to the visito
 LANGUAGE INSTRUCTION: {directive}
 
 {self.formatting_rules}
+
+{EXHIBIT_CONTEXT}
 
 {profile_block}
 {rag_block}
