@@ -105,6 +105,8 @@ WHISPER_BEAM_SIZE = 5
 WHISPER_PROFILE_BEAM_SIZE = 5
 WHISPER_LANGUAGE_LOCK_AFTER_PROFILE = True
 WHISPER_ALLOWED_LANGS = {"en", "fr", "es", "it"}
+FRENCH_RESCUE_ENABLED = True
+FRENCH_RESCUE_BEAM_SIZE = 5
 DEFAULT_LANG_CODE = "en"
 
 WHISPER_LANG_TO_KEY = {
@@ -244,6 +246,16 @@ LANGUAGE_SWITCH_VERBS = (
     "parle", "parlez", "parler", "reponds", "repondez", "repondre",
     "speak", "talk", "answer", "respond", "switch", "change",
 )
+
+FRENCH_MISHEAR_RESCUES = {
+    "who is there": "qui est la joconde",
+    "who's there": "qui est la joconde",
+    "whos there": "qui est la joconde",
+    "who is she": "qui est la joconde",
+    "who's she": "qui est la joconde",
+    "who is la": "qui est la joconde",
+    "who's la": "qui est la joconde",
+}
 
 MEMORY_TURNS = 10
 
@@ -441,6 +453,12 @@ def _parse_language_switch_marker(text: str) -> str | None:
         return None
     target = cleaned[len(marker):].strip().split(None, 1)[0] if len(cleaned) > len(marker) else ""
     return target if target in LANGUAGES else None
+
+
+def _french_mishear_rescue(text: str) -> str | None:
+    norm = _strip_accents(text)
+    norm = re.sub(r"[^a-z0-9']+", " ", norm).strip()
+    return FRENCH_MISHEAR_RESCUES.get(norm)
 
 
 def _piper_synthesize(voice: str, text: str, out_path: str) -> bool:
@@ -1358,6 +1376,37 @@ Use the museum sheet as ground truth if present.
         print(f"[Timing] STT: {time.time() - t0:.2f}s")
         return (text.strip(), lang_code)
 
+    def _should_try_french_rescue(self, text: str, lang_code: str) -> bool:
+        if not FRENCH_RESCUE_ENABLED or lang_code == "fr":
+            return False
+        active_lang = self._get_active_language()
+        if active_lang == "french":
+            return True
+        if _detect_artwork_query(text) is not None:
+            return False
+        norm = _strip_accents(text)
+        return any(word in norm for word in ("joconde", "francais", "etoile", "masque"))
+
+    def _rescue_french_transcription(self, audio_int16: np.ndarray, text: str, lang_code: str) -> tuple[str, str]:
+        mapped = _french_mishear_rescue(text)
+        if mapped and (self._get_active_language() == "french" or _detect_artwork_query(mapped)):
+            print(f"[STT] French rescue mapped: {text!r} -> {mapped!r}")
+            return (mapped, "fr")
+        if not self._should_try_french_rescue(text, lang_code):
+            return (text, lang_code)
+        fr_text, fr_lang = self._transcribe_audio(
+            audio_int16,
+            force_language="fr",
+            beam_size=FRENCH_RESCUE_BEAM_SIZE,
+        )
+        if not fr_text:
+            return (text, lang_code)
+        if _detect_artwork_query(fr_text) or _detect_language_switch(fr_text) or self._get_active_language() == "french":
+            print(f"[STT] French rescue accepted: {text!r} -> {fr_text!r}")
+            return (fr_text, fr_lang)
+        print(f"[STT] French rescue ignored: {fr_text!r}")
+        return (text, lang_code)
+
     def _transcribe_worker(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -1381,6 +1430,7 @@ Use the museum sheet as ground truth if present.
             text, lang_code = self._transcribe_audio(audio_int16, force_language=force_language)
             if not text:
                 continue
+            text, lang_code = self._rescue_french_transcription(audio_int16, text, lang_code)
             lang_key = WHISPER_LANG_TO_KEY.get(lang_code, DEFAULT_LANGUAGE)
             self._set_active_language(lang_key)
             print(f"\n[Heard] ({lang_code}, dur={duration:.1f}s): {text}")
