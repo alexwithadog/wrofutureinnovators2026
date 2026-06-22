@@ -1,0 +1,23 @@
+# ATLAS visitor profiles. Each maps to a SessionProfile.
+# educational_level must be one of:
+#   child | teen | adult_beginner | expert | visual_impairment | simple_language
+
+profiles:
+  child:
+    educational_level: child
+    description: "Simple, vivid, story-like. One short idea at a time."
+  teen:
+    educational_level: teen
+    description: "Direct and engaging, a little context."
+  adult_beginner:
+    educational_level: adult_beginner
+    description: "Simple but mature framing."
+  expert:
+    educational_level: expert
+    description: "Historical, technical, symbolic depth. Longer answers allowed."
+  visual_impairment:
+    educational_level: visual_impairment
+    description: "Describe shape, color, composition, atmosphere. Longer answers allowed."
+  simple_language:
+    educational_level: simple_language
+    description: "Very simple sentences for cognitive or language difficulty."

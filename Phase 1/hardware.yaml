@@ -1,0 +1,22 @@
+# ATLAS hardware configuration (consumed by the device layer in Phase 4).
+# In dev/local modes these values are ignored; mocks are used instead.
+
+camera:
+  index: 0
+  width: 1280
+  height: 720
+  fps: 15
+
+audio:
+  input_device: "Shokz OpenComm2 UC"
+  output_device: "Shokz OpenComm2 UC"
+  sample_rate: 16000
+
+jetson:
+  board: "Seeed reComputer Super J401 NX 16GB"
+  jetpack: "6.1"
+
+exhibit:
+  enable_servo: false
+  enable_ev3: false
+  servo_voltage: 6.0   # FeeTech FT5478M expects ~7.4V; verify PSU before enabling

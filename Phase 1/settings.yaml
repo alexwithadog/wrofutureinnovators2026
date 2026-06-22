@@ -1,0 +1,42 @@
+# ATLAS School Pilot v1 - application settings
+# Secrets (API keys) are NEVER stored here. They are read from the
+# environment variable named by llm.api_key_env (see .env.example).
+
+mode: dev
+default_pack_id: demo_pack
+
+paths:
+  data_dir: data
+  content_packs_dir: data/content_packs
+  chroma_dir: data/chroma
+  sqlite_dir: data/sqlite
+  logs_dir: data/logs
+
+rag:
+  top_k: 5
+  dense_top_k: 10
+  keyword_top_k: 10
+  rrf_k: 60
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  use_dense: true
+  use_keyword: true
+  use_cross_encoder_reranker: false
+
+llm:
+  provider: mock        # mock | gemini
+  model: gemini-2.5-flash
+  timeout_s: 8.0
+  max_regenerations: 1
+  api_key_env: GEMINI_API_KEY
+
+logging:
+  level: INFO
+  json_lines: true
+  log_transcripts: false   # privacy default: do not log transcripts
+  retention_days: 30
+
+hardware:
+  camera_index: 0
+  headset_name: "Shokz OpenComm2 UC"
+  enable_servo: false
+  enable_ev3: false
