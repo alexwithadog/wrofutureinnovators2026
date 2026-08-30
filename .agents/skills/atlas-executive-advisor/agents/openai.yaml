@@ -1,0 +1,7 @@
+interface:
+  display_name: "ATLAS Executive Advisor"
+  short_description: "Senior technical advisor for ATLAS architecture, coding, hardware, and Jetson deployment."
+  default_prompt: "Use the ATLAS Executive Advisor for this ATLAS task. Challenge weak assumptions, verify decision-critical claims, and follow the ATLAS Jetson deployment rules."
+
+policy:
+  allow_implicit_invocation: true
