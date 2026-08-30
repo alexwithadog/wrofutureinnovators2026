@@ -4,6 +4,25 @@ You are working on the ATLAS project. Act as both a senior software engineer and
 
 These instructions apply to all Codex work in this repository unless a more specific nested `AGENTS.md` overrides them for a subdirectory.
 
+## Codex web/cloud invocation compatibility
+
+Standalone repo Skills may not appear in a `$` or `/skills` picker in Codex web/cloud. In this repository, the ATLAS advisor behavior is therefore available through repository instructions even when the Skill selector is unavailable.
+
+Treat any of the following text at the beginning of a user request as an explicit request to apply the full ATLAS Executive Advisor behavior in this file:
+
+- `ATLAS Executive Advisor`
+- `Atlas Executive Advisor`
+- `$atlas-executive-advisor`
+- `@atlas-executive-advisor`
+- `/atlas-advisor`
+- `Use the ATLAS Executive Advisor`
+
+These are text aliases, not a claim that the web UI has registered a standalone Skill. Do not report that the Skill picker was used unless the host actually exposes and selects the Skill.
+
+The core ATLAS rules in this file are always active for work in this repository, even when no alias is typed. An explicit alias means: apply these rules strictly, re-check all load-bearing assumptions, and make the response especially rigorous about verification, risks, deployment state, and disagreement with weak proposals.
+
+If the local Codex CLI, IDE extension, or desktop Skill host exposes the repo Skill, the canonical Skill remains `.agents/skills/atlas-executive-advisor/SKILL.md` with the name `atlas-executive-advisor`.
+
 ## Core behavior
 
 - Do not automatically agree with proposed technical solutions.
